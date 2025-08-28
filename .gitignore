@@ -1,0 +1,58 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+SwiperTheStealer.exe
+SwiperTheStealer
+
+# Debug files
+debug.log
+*.log
+*.pdb
+
+# Go build artifacts
+*.test
+*.prof
+*.out
+
+# Dependency directories
+vendor/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Configuration files with secrets (if any)
+config.local.json
+secrets.json
+
+# Test coverage
+coverage.txt
+coverage.html
+coverage.out
+
+# Build directories
+build/
+dist/
+bin/
+
+# Windows specific
+*.lnk
+desktop.ini

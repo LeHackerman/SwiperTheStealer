@@ -275,7 +275,7 @@ func (kld *KernelLsassDumper) decryptAndParseCred(encryptedData []byte, aesKey [
 		kld.logger.Debugf("    Decrypted with 3DES (len=%d)", len(decrypted))
 	}
 
-	if decrypted == nil || len(decrypted) < 0x70 {
+	if len(decrypted) < 0x70 {
 		return nil
 	}
 
